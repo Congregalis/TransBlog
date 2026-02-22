@@ -1,0 +1,13 @@
+.env
+/transblog
+
+# build and generated output
+out/
+out-*/
+dist/
+bin/
+
+# tooling and local artifacts
+.DS_Store
+coverage.out
+*.log
