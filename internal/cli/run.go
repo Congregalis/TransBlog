@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"transblog/internal/chunk"
@@ -21,7 +22,10 @@ import (
 	"transblog/internal/openai"
 )
 
-const defaultChunkSize = 2000
+const (
+	defaultChunkSize        = 2000
+	defaultTranslateWorkers = 4
+)
 
 type options struct {
 	Model      string
@@ -58,8 +62,7 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 
 	openAIClient := openai.NewClient(apiKey, baseURL, httpClient)
 
-	// Collect source/translation pairs for view mode
-	var pairs []pair
+	var tasks []translationTask
 
 	ctx := context.Background()
 	for _, rawURL := range opts.SourceURLs {
@@ -79,14 +82,19 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		}
 
 		for idx, mdChunk := range chunks {
-			translated, err := openAIClient.TranslateMarkdownChunk(ctx, opts.Model, mdChunk, glossaryMap)
-			if err != nil {
-				return fmt.Errorf("translate chunk %d for %s: %w", idx+1, sourceURL, err)
-			}
-			translated = glossary.Apply(translated, glossaryMap)
-
-			pairs = append(pairs, pair{sourceURL: sourceURL, source: mdChunk, translated: translated})
+			tasks = append(tasks, translationTask{
+				outputIndex: len(tasks),
+				sourceURL:   sourceURL,
+				sourceChunk: mdChunk,
+				chunkNumber: idx + 1,
+				chunkTotal:  len(chunks),
+			})
 		}
+	}
+
+	pairs, err := translateAllChunks(ctx, openAIClient, opts.Model, glossaryMap, tasks, stderr)
+	if err != nil {
+		return err
 	}
 
 	var output strings.Builder
@@ -195,6 +203,152 @@ func fetchAndConvert(ctx context.Context, httpClient *http.Client, sourceURL str
 	return md, nil
 }
 
+type translationTask struct {
+	outputIndex int
+	sourceURL   string
+	sourceChunk string
+	chunkNumber int
+	chunkTotal  int
+}
+
+type translationResult struct {
+	task       translationTask
+	translated string
+	err        error
+}
+
+func translateAllChunks(
+	ctx context.Context,
+	client *openai.Client,
+	model string,
+	glossaryMap map[string]string,
+	tasks []translationTask,
+	progress io.Writer,
+) ([]pair, error) {
+	if len(tasks) == 0 {
+		return nil, nil
+	}
+	if progress == nil {
+		progress = io.Discard
+	}
+
+	workerCount := defaultTranslateWorkers
+	if workerCount > len(tasks) {
+		workerCount = len(tasks)
+	}
+	if workerCount < 1 {
+		workerCount = 1
+	}
+
+	_, _ = fmt.Fprintf(progress, "Translating %d chunks with %d workers...\n", len(tasks), workerCount)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	jobs := make(chan translationTask)
+	results := make(chan translationResult, len(tasks))
+
+	var wg sync.WaitGroup
+	for i := 0; i < workerCount; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range jobs {
+				if runCtx.Err() != nil {
+					return
+				}
+
+				translated, err := client.TranslateMarkdownChunk(runCtx, model, task.sourceChunk, glossaryMap)
+				if err != nil {
+					select {
+					case results <- translationResult{task: task, err: fmt.Errorf("translate chunk %d for %s: %w", task.chunkNumber, task.sourceURL, err)}:
+					case <-runCtx.Done():
+					}
+					cancel()
+					return
+				}
+
+				translated = glossary.Apply(translated, glossaryMap)
+				select {
+				case results <- translationResult{task: task, translated: translated}:
+				case <-runCtx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(jobs)
+		for _, task := range tasks {
+			select {
+			case <-runCtx.Done():
+				return
+			case jobs <- task:
+			}
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	pairs := make([]pair, len(tasks))
+	completed := 0
+	var firstErr error
+
+	for result := range results {
+		if result.err != nil {
+			if firstErr == nil {
+				firstErr = result.err
+			}
+			continue
+		}
+
+		task := result.task
+		pairs[task.outputIndex] = pair{
+			sourceURL:  task.sourceURL,
+			source:     task.sourceChunk,
+			translated: result.translated,
+		}
+
+		completed++
+		percent := completed * 100 / len(tasks)
+		_, _ = fmt.Fprintf(
+			progress,
+			"[%d/%d] %d%% translated chunk %d/%d for %s\n",
+			completed,
+			len(tasks),
+			percent,
+			task.chunkNumber,
+			task.chunkTotal,
+			compactURL(task.sourceURL),
+		)
+	}
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
+
+	_, _ = fmt.Fprintf(progress, "Translation complete: %d chunks.\n", completed)
+	return pairs, nil
+}
+
+func compactURL(rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return rawURL
+	}
+
+	path := strings.TrimSuffix(parsed.Path, "/")
+	if path == "" {
+		return parsed.Host
+	}
+
+	return parsed.Host + path
+}
+
 func writeFrontMatter(w io.StringWriter, opts options) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, _ = w.WriteString("---\n")
@@ -265,7 +419,8 @@ func writeHTMLView(w io.StringWriter, pairs []pair, opts options) {
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Bilingual View</title>
+<title>TransBlog</title>
+<link rel="icon" href="data:,">
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github-dark.min.css">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -312,6 +467,10 @@ body {
   background: rgba(255, 255, 255, 0.06);
   font-family: "Avenir Next", "Segoe UI", sans-serif;
 }
+button.toolbar-item {
+  color: inherit;
+  cursor: pointer;
+}
 .toolbar-item select {
   border: 1px solid rgba(255, 255, 255, 0.28);
   background: #1e293b;
@@ -330,9 +489,57 @@ body {
 .layout {
   height: calc(100vh - 108px);
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 260px 1fr 1fr;
   gap: 12px;
   padding: 12px;
+}
+.toc-collapsed .layout {
+  grid-template-columns: 1fr 1fr;
+}
+.toc-collapsed .toc-pane {
+  display: none;
+}
+.toc-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border: 1px solid #dbe3ef;
+  border-radius: 12px;
+  overflow: hidden;
+  background: #ffffff;
+  box-shadow: 0 12px 36px rgba(15, 23, 42, 0.1);
+}
+.toc-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px;
+}
+.toc-link {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 0;
+  background: transparent;
+  color: #334155;
+  border-radius: 8px;
+  padding: 7px 10px;
+  margin-bottom: 4px;
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  font-size: 13px;
+  cursor: pointer;
+}
+.toc-link.level-2 {
+  padding-left: 18px;
+  font-size: 12px;
+}
+.toc-link:hover {
+  background: #e2e8f0;
+}
+.toc-link.active {
+  background: #dbeafe;
+  color: #0f172a;
+  font-weight: 700;
 }
 .pane {
   display: flex;
@@ -427,6 +634,88 @@ body {
   font-family: "Avenir Next", "Segoe UI", sans-serif;
   font-size: 14px;
 }
+body.theme-dark {
+  color: #e2e8f0;
+  background: radial-gradient(circle at 20% 0%, #0f172a 0%, #020617 44%, #030712 100%);
+}
+body.theme-dark .topbar {
+  background: #020617;
+  color: #e2e8f0;
+  border-bottom-color: rgba(148, 163, 184, 0.3);
+}
+body.theme-dark .toolbar-item {
+  border-color: rgba(148, 163, 184, 0.45);
+  background: rgba(148, 163, 184, 0.15);
+  color: #e2e8f0;
+}
+body.theme-dark .toolbar-item select {
+  border-color: rgba(148, 163, 184, 0.55);
+  background: #0f172a;
+  color: #e2e8f0;
+}
+body.theme-dark .toc-pane,
+body.theme-dark .pane {
+  background: #0f172a;
+  border-color: #334155;
+  box-shadow: 0 12px 36px rgba(2, 6, 23, 0.45);
+}
+body.theme-dark .pane-head {
+  background: linear-gradient(180deg, #111827 0%, #0b1220 100%);
+  border-bottom-color: #334155;
+  color: #cbd5e1;
+}
+body.theme-dark .chunk {
+  border-bottom-color: #334155;
+}
+body.theme-dark .chunk-meta,
+body.theme-dark .empty-state {
+  color: #94a3b8;
+}
+body.theme-dark .toc-link {
+  color: #cbd5e1;
+}
+body.theme-dark .toc-link:hover {
+  background: #1e293b;
+}
+body.theme-dark .toc-link.active {
+  background: #1d4ed8;
+  color: #e2e8f0;
+}
+body.theme-dark .markdown-body code {
+  background: #1e293b;
+  color: #e2e8f0;
+}
+body.theme-dark .markdown-body pre {
+  background: #020617;
+  color: #dbeafe;
+}
+body.theme-dark .markdown-body blockquote {
+  border-left-color: #60a5fa;
+  color: #cbd5e1;
+}
+body.theme-dark .markdown-body a {
+  color: #93c5fd;
+}
+body.theme-dark .markdown-body th,
+body.theme-dark .markdown-body td {
+  border-color: #334155;
+}
+@media (max-width: 1240px) {
+  .layout {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: minmax(180px, 28vh) minmax(0, 1fr);
+    height: calc(100vh - 96px);
+    min-height: 0;
+  }
+  .toc-pane {
+    grid-column: 1 / -1;
+    min-height: 0;
+  }
+  .toc-collapsed .layout {
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: minmax(0, 1fr);
+  }
+}
 @media (max-width: 980px) {
   .topbar {
     padding: 12px 14px 10px;
@@ -444,6 +733,12 @@ body {
     padding: 10px;
     gap: 10px;
   }
+  .toc-pane {
+    min-height: 200px;
+  }
+  .toc-collapsed .layout {
+    grid-template-columns: 1fr;
+  }
   .pane { min-height: 44vh; }
 }
 </style>
@@ -452,7 +747,7 @@ body {
 `)
 
 	_, _ = w.WriteString("<header class=\"topbar\">\n")
-	_, _ = w.WriteString("<h1>Bilingual View</h1>\n")
+	_, _ = w.WriteString("<h1 id=\"page-title\">TransBlog</h1>\n")
 	_, _ = w.WriteString("<div class=\"meta\">Generated: ")
 	_, _ = w.WriteString(now)
 	_, _ = w.WriteString(" | Model: ")
@@ -463,6 +758,9 @@ body {
 	_, _ = w.WriteString("<div class=\"toolbar\">\n")
 	_, _ = w.WriteString("  <label class=\"toolbar-item\">")
 	_, _ = w.WriteString("<input id=\"sync-lock\" type=\"checkbox\" checked> 同步滚动</label>\n")
+	_, _ = w.WriteString("  <label class=\"toolbar-item\">")
+	_, _ = w.WriteString("<input id=\"theme-toggle\" type=\"checkbox\"> 深色模式</label>\n")
+	_, _ = w.WriteString("  <button id=\"toc-toggle\" class=\"toolbar-item\" type=\"button\" aria-expanded=\"true\">收起目录</button>\n")
 	_, _ = w.WriteString("  <label class=\"toolbar-item\">Chunk")
 	_, _ = w.WriteString("<select id=\"chunk-jump\"></select></label>\n")
 	_, _ = w.WriteString("  <div class=\"toolbar-item progress-chip\" id=\"reading-progress\">Chunk 0 / 0</div>\n")
@@ -470,6 +768,10 @@ body {
 	_, _ = w.WriteString("</header>\n")
 
 	_, _ = w.WriteString("<main class=\"layout\">\n")
+	_, _ = w.WriteString("  <aside class=\"toc-pane\">\n")
+	_, _ = w.WriteString("    <div class=\"pane-head\">目录</div>\n")
+	_, _ = w.WriteString("    <div id=\"toc-nav\" class=\"toc-scroll\"></div>\n")
+	_, _ = w.WriteString("  </aside>\n")
 	_, _ = w.WriteString("  <section class=\"pane\">\n")
 	_, _ = w.WriteString("    <div class=\"pane-head\">English</div>\n")
 	_, _ = w.WriteString("    <div id=\"pane-en\" class=\"pane-scroll\"></div>\n")
@@ -492,7 +794,10 @@ body {
 
   const paneEN = document.getElementById("pane-en");
   const paneZH = document.getElementById("pane-zh");
+  const tocNav = document.getElementById("toc-nav");
   const syncLock = document.getElementById("sync-lock");
+  const themeToggle = document.getElementById("theme-toggle");
+  const tocToggle = document.getElementById("toc-toggle");
   const chunkJump = document.getElementById("chunk-jump");
   const progressEl = document.getElementById("reading-progress");
 
@@ -516,6 +821,7 @@ body {
   let activePaneId = "en";
   let syncScheduled = false;
   let resizeRAF = 0;
+  let tocCollapsed = false;
 
   if (window.marked && typeof window.marked.setOptions === "function") {
     window.marked.setOptions({
@@ -524,6 +830,32 @@ body {
       headerIds: false,
       mangle: false,
     });
+  }
+
+  function applyTheme(themeName) {
+    const dark = themeName === "dark";
+    document.body.classList.toggle("theme-dark", dark);
+    if (themeToggle) {
+      themeToggle.checked = dark;
+    }
+  }
+
+  if (themeToggle) {
+    const prefersDark = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    applyTheme(prefersDark ? "dark" : "light");
+    themeToggle.addEventListener("change", function () {
+      applyTheme(themeToggle.checked ? "dark" : "light");
+    });
+  }
+
+  function applyTOCState(collapsed) {
+    tocCollapsed = Boolean(collapsed);
+    document.body.classList.toggle("toc-collapsed", tocCollapsed);
+    if (!tocToggle) {
+      return;
+    }
+    tocToggle.setAttribute("aria-expanded", tocCollapsed ? "false" : "true");
+    tocToggle.textContent = tocCollapsed ? "展开目录" : "收起目录";
   }
 
   function nowMS() {
@@ -573,6 +905,52 @@ body {
     });
   }
 
+  function fixImageAttributes(root, baseURL) {
+    if (!root) {
+      return;
+    }
+    root.querySelectorAll("img").forEach(function (img) {
+      const src = img.getAttribute("src");
+      if (src && !src.startsWith("http:") && !src.startsWith("https:") && !src.startsWith("data:")) {
+        try {
+          img.src = new URL(src, baseURL).href;
+        } catch (_) {
+          img.src = src;
+        }
+      }
+      img.setAttribute("referrerpolicy", "no-referrer");
+      img.setAttribute("loading", "lazy");
+    });
+  }
+
+  function slugifyHeading(text) {
+    return String(text || "")
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9\u4e00-\u9fff\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "");
+  }
+
+  function annotateEnglishHeadings(root, chunkIndex) {
+    if (!root) {
+      return;
+    }
+    const headings = root.querySelectorAll("h1, h2");
+    headings.forEach(function (heading, headingIndex) {
+      const slug = slugifyHeading(heading.textContent);
+      const suffix = slug || "section";
+      heading.id = "en-heading-" + chunkIndex + "-" + headingIndex + "-" + suffix;
+    });
+  }
+
+  function elementTopInPane(element, pane) {
+    const elementRect = element.getBoundingClientRect();
+    const paneRect = pane.getBoundingClientRect();
+    return elementRect.top - paneRect.top + pane.scrollTop;
+  }
+
   function compactURL(urlText) {
     try {
       const url = new URL(urlText);
@@ -608,6 +986,10 @@ body {
       const body = document.createElement("div");
       body.className = "markdown-body";
       body.innerHTML = renderMarkdown(item[key]);
+      if (paneId === "en") {
+        annotateEnglishHeadings(body, index);
+      }
+      fixImageAttributes(body, item.sourceURL);
       applyHighlighting(body);
 
       chunk.appendChild(meta);
@@ -618,8 +1000,87 @@ body {
     chunkNodes[paneId] = Array.from(pane.querySelectorAll(".chunk"));
   }
 
+  function updateTitleFromContent() {
+    const titleEl = document.getElementById("page-title");
+    const firstH1 = paneEN.querySelector("h1");
+    const title = firstH1 && firstH1.textContent ? firstH1.textContent.trim() : "";
+    const finalTitle = title || "TransBlog";
+    if (titleEl) {
+      titleEl.textContent = finalTitle;
+    }
+    document.title = finalTitle;
+  }
+
+  function updateTOCActive() {
+    if (!tocNav) {
+      return;
+    }
+    const links = Array.from(tocNav.querySelectorAll(".toc-link"));
+    if (links.length === 0) {
+      return;
+    }
+
+    let activeIndex = 0;
+    const threshold = paneEN.scrollTop + 12;
+    links.forEach(function (link, index) {
+      const targetId = link.getAttribute("data-target-id");
+      if (!targetId) {
+        return;
+      }
+      const heading = document.getElementById(targetId);
+      if (heading && elementTopInPane(heading, paneEN) <= threshold) {
+        activeIndex = index;
+      }
+    });
+
+    links.forEach(function (link, index) {
+      link.classList.toggle("active", index === activeIndex);
+    });
+  }
+
+  function buildTOC() {
+    if (!tocNav) {
+      return;
+    }
+
+    tocNav.innerHTML = "";
+    const headings = Array.from(paneEN.querySelectorAll("h1, h2"));
+    if (headings.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "empty-state";
+      empty.textContent = "No headings available.";
+      tocNav.appendChild(empty);
+      return;
+    }
+
+    headings.forEach(function (heading, index) {
+      const text = heading.textContent ? heading.textContent.trim() : "";
+      const label = text || ("Section " + (index + 1));
+      const level = heading.tagName === "H1" ? 1 : 2;
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "toc-link level-" + level;
+      button.textContent = label;
+      button.setAttribute("data-target-id", heading.id);
+      button.addEventListener("click", function () {
+        activePaneId = "en";
+        const targetTop = Math.max(elementTopInPane(heading, paneEN) - 8, 0);
+        markSuppressed("en", 140);
+        paneEN.scrollTo({ top: targetTop, behavior: "smooth" });
+        window.setTimeout(function () {
+          scheduleSyncFrom("en");
+        }, 160);
+      });
+      tocNav.appendChild(button);
+    });
+
+    updateTOCActive();
+  }
+
   renderPane("en", "source");
   renderPane("zh", "translated");
+  updateTitleFromContent();
+  buildTOC();
 
   function updateChunkJumpOptions() {
     chunkJump.innerHTML = "";
@@ -731,6 +1192,7 @@ body {
     if (!chunkJump.disabled) {
       chunkJump.value = String(safeIndex);
     }
+    updateTOCActive();
   }
 
   function syncTargetFromSource(sourcePaneId) {
@@ -800,6 +1262,15 @@ body {
     scheduleSyncFrom(activePaneId);
   });
 
+  if (tocToggle) {
+    tocToggle.addEventListener("click", function () {
+      applyTOCState(!tocCollapsed);
+      window.requestAnimationFrame(function () {
+        scheduleSyncFrom(activePaneId);
+      });
+    });
+  }
+
   function bindPaneEvents(paneId) {
     const pane = panes[paneId].el;
 
@@ -831,6 +1302,7 @@ body {
   });
 
   updateProgress("en");
+  applyTOCState(false);
 })();
 </script>
 `)
