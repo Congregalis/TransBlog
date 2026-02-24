@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestRunMultiURLWritesPerURLOutputsAndSummary(t *testing.T) {
@@ -342,6 +343,223 @@ func TestRunSummaryIncludesOutputErrorType(t *testing.T) {
 	}
 	if !strings.Contains(outputFailure.ErrorMessage, "write output file") {
 		t.Fatalf("error_message=%q, want write output context", outputFailure.ErrorMessage)
+	}
+}
+
+func TestRunFailFastStopsAfterFirstFailure(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/bad":
+			http.Error(w, "broken", http.StatusInternalServerError)
+		case "/ok":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(sampleArticle("OK", "good content")))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(contentServer.Close)
+
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"译文内容"}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	tmpDir := useTempWorkingDir(t)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	badURL := contentServer.URL + "/bad"
+	okURL := contentServer.URL + "/ok"
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	err := Run([]string{"--fail-fast", badURL, okURL}, &stdout, &stderr)
+	if err == nil {
+		t.Fatalf("Run() error = nil, want fail-fast error")
+	}
+
+	summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
+	rawSummary, err := os.ReadFile(summaryPath)
+	if err != nil {
+		t.Fatalf("read summary file: %v", err)
+	}
+
+	var summary taskSummary
+	if err := json.Unmarshal(rawSummary, &summary); err != nil {
+		t.Fatalf("unmarshal summary JSON: %v", err)
+	}
+
+	if len(summary.Results) != 1 {
+		t.Fatalf("summary result len=%d, want 1 due to fail-fast stop", len(summary.Results))
+	}
+	if summary.Results[0].SourceURL != badURL {
+		t.Fatalf("summary first source_url=%q, want %q", summary.Results[0].SourceURL, badURL)
+	}
+	if !strings.Contains(stderr.String(), "Fail-fast enabled: stop after first failure.") {
+		t.Fatalf("stderr missing fail-fast message: %s", stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Done: 0 succeeded, 1 failed") {
+		t.Fatalf("stdout missing final summary: %s", stdout.String())
+	}
+}
+
+func TestRunMaxRetriesFlagControlsOpenAIRetry(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/retry" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleArticle("Retry", "retry content")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	var callCount int32
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+
+		n := atomic.AddInt32(&callCount, 1)
+		if n == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = io.WriteString(w, `{"error":{"message":"temporary upstream failure"}}`)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"译文内容"}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+	sourceURL := contentServer.URL + "/retry"
+
+	dirNoRetry := t.TempDir()
+	runInWorkingDir(t, dirNoRetry, func() string {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		atomic.StoreInt32(&callCount, 0)
+
+		err := Run([]string{"--chunk-size", "10000", "--max-retries", "0", sourceURL}, &stdout, &stderr)
+		if err == nil {
+			t.Fatalf("Run() error = nil, want failure when retries are disabled")
+		}
+		if got := atomic.LoadInt32(&callCount); got != 1 {
+			t.Fatalf("OpenAI call count=%d, want 1 with --max-retries=0", got)
+		}
+		return ""
+	})
+
+	dirWithRetry := t.TempDir()
+	runInWorkingDir(t, dirWithRetry, func() string {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		atomic.StoreInt32(&callCount, 0)
+
+		if err := Run([]string{"--chunk-size", "10000", "--max-retries", "1", sourceURL}, &stdout, &stderr); err != nil {
+			t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
+		}
+		if got := atomic.LoadInt32(&callCount); got != 2 {
+			t.Fatalf("OpenAI call count=%d, want 2 with --max-retries=1", got)
+		}
+		return ""
+	})
+}
+
+func TestRunWorkersFlagChangesConcurrency(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/parallel" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleLongArticle("Parallel")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	var inFlight int32
+	var maxInFlight int32
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+
+		current := atomic.AddInt32(&inFlight, 1)
+		for {
+			prev := atomic.LoadInt32(&maxInFlight)
+			if current <= prev {
+				break
+			}
+			if atomic.CompareAndSwapInt32(&maxInFlight, prev, current) {
+				break
+			}
+		}
+		time.Sleep(25 * time.Millisecond)
+		atomic.AddInt32(&inFlight, -1)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"译文内容"}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+	sourceURL := contentServer.URL + "/parallel"
+
+	singleWorkerDir := t.TempDir()
+	runInWorkingDir(t, singleWorkerDir, func() string {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		atomic.StoreInt32(&inFlight, 0)
+		atomic.StoreInt32(&maxInFlight, 0)
+
+		if err := Run([]string{"--chunk-size", "80", "--workers", "1", sourceURL}, &stdout, &stderr); err != nil {
+			t.Fatalf("Run() with --workers=1 error = %v; stderr=%s", err, stderr.String())
+		}
+		if got := atomic.LoadInt32(&maxInFlight); got != 1 {
+			t.Fatalf("max in-flight=%d, want 1 when workers=1", got)
+		}
+		return ""
+	})
+
+	multiWorkerDir := t.TempDir()
+	runInWorkingDir(t, multiWorkerDir, func() string {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		atomic.StoreInt32(&inFlight, 0)
+		atomic.StoreInt32(&maxInFlight, 0)
+
+		if err := Run([]string{"--chunk-size", "80", "--workers", "4", sourceURL}, &stdout, &stderr); err != nil {
+			t.Fatalf("Run() with --workers=4 error = %v; stderr=%s", err, stderr.String())
+		}
+		if got := atomic.LoadInt32(&maxInFlight); got <= 1 {
+			t.Fatalf("max in-flight=%d, want >1 when workers=4", got)
+		}
+		return ""
+	})
+}
+
+func TestParseFlagsRejectsInvalidWorkers(t *testing.T) {
+	_, err := parseFlags([]string{"--workers", "0", "https://example.com"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "--workers must be greater than 0") {
+		t.Fatalf("parseFlags error=%v, want workers validation error", err)
+	}
+}
+
+func TestParseFlagsRejectsInvalidMaxRetries(t *testing.T) {
+	_, err := parseFlags([]string{"--max-retries", "-1", "https://example.com"}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "--max-retries must be 0 or greater") {
+		t.Fatalf("parseFlags error=%v, want max-retries validation error", err)
 	}
 }
 

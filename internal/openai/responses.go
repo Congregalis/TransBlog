@@ -17,18 +17,19 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://api.openai.com/v1"
-	maxErrBody     = 2048
-	maxRetries     = 5
+	defaultBaseURL    = "https://api.openai.com/v1"
+	maxErrBody        = 2048
+	defaultMaxRetries = 5
 )
 
 type Client struct {
 	apiKey     string
 	endpoint   string
 	httpClient *http.Client
+	maxRetries int
 }
 
-func NewClient(apiKey string, baseURL string, httpClient *http.Client) *Client {
+func NewClient(apiKey string, baseURL string, httpClient *http.Client, maxRetries int) *Client {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultBaseURL
 	}
@@ -36,11 +37,15 @@ func NewClient(apiKey string, baseURL string, httpClient *http.Client) *Client {
 	if strings.HasSuffix(baseURL, "/v1") {
 		baseURL = strings.TrimSuffix(baseURL, "/v1")
 	}
+	if maxRetries < 0 {
+		maxRetries = defaultMaxRetries
+	}
 
 	return &Client{
 		apiKey:     apiKey,
 		endpoint:   baseURL + "/v1/responses",
 		httpClient: httpClient,
+		maxRetries: maxRetries,
 	}
 }
 
@@ -88,14 +93,14 @@ func (c *Client) TranslateMarkdownChunk(ctx context.Context, model string, mdChu
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= maxRetries; attempt++ {
+	for attempt := 0; attempt <= c.maxRetries; attempt++ {
 		translated, retry, err := c.callResponses(ctx, body)
 		if err == nil {
 			return translated, nil
 		}
 
 		lastErr = err
-		if !retry || attempt == maxRetries {
+		if !retry || attempt == c.maxRetries {
 			break
 		}
 

@@ -28,6 +28,7 @@ import (
 const (
 	defaultChunkSize        = 2000
 	defaultTranslateWorkers = 4
+	defaultMaxRetries       = 5
 	defaultOutDir           = "out"
 	summaryFileName         = "_summary.json"
 	stateFileName           = ".transblog.state.json"
@@ -43,6 +44,9 @@ type options struct {
 	Model      string
 	OutPath    string
 	View       bool
+	Workers    int
+	MaxRetries int
+	FailFast   bool
 	Glossary   string
 	Timeout    time.Duration
 	ChunkSize  int
@@ -173,7 +177,7 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return err
 	}
 
-	openAIClient := openai.NewClient(apiKey, baseURL, httpClient)
+	openAIClient := openai.NewClient(apiKey, baseURL, httpClient, opts.MaxRetries)
 	runCtx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
 	runStart := time.Now()
@@ -200,6 +204,10 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 			summary.FailureCount++
 			summary.Results = append(summary.Results, item)
 			_, _ = fmt.Fprintf(stderr, "Failed [%s]: %s (%s)\n", errorType, compactURL(sourceURL), errorMessage)
+			if opts.FailFast {
+				_, _ = fmt.Fprintln(stderr, "Fail-fast enabled: stop after first failure.")
+				break
+			}
 			continue
 		}
 
@@ -245,6 +253,9 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&opts.Model, "model", "gpt-5.2", "OpenAI model name")
 	fs.StringVar(&opts.OutPath, "out", "", "Output path: file for single URL, directory for multiple URLs (default: ./out/)")
 	fs.BoolVar(&opts.View, "view", false, "Generate HTML split-view with Markdown rendering and synchronized scrolling")
+	fs.IntVar(&opts.Workers, "workers", defaultTranslateWorkers, "Translation worker count")
+	fs.IntVar(&opts.MaxRetries, "max-retries", defaultMaxRetries, "Maximum retries for OpenAI requests")
+	fs.BoolVar(&opts.FailFast, "fail-fast", false, "Stop at first URL failure (default: continue for partial success)")
 	fs.StringVar(&opts.Glossary, "glossary", "", "Path to glossary JSON map, e.g. {\"term\":\"translation\"}")
 	fs.DurationVar(&opts.Timeout, "timeout", 90*time.Second, "HTTP timeout, e.g. 120s")
 	fs.IntVar(&opts.ChunkSize, "chunk-size", defaultChunkSize, "Target chunk size in characters")
@@ -267,6 +278,12 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	}
 	if opts.Timeout <= 0 {
 		return options{}, errors.New("--timeout must be positive")
+	}
+	if opts.Workers <= 0 {
+		return options{}, errors.New("--workers must be greater than 0")
+	}
+	if opts.MaxRetries < 0 {
+		return options{}, errors.New("--max-retries must be 0 or greater")
 	}
 	if opts.ChunkSize <= 0 {
 		opts.ChunkSize = defaultChunkSize
@@ -561,6 +578,8 @@ func processURL(
 			glossaryMap,
 			tasks,
 			progress,
+			opts.Workers,
+			opts.FailFast,
 			func(task translationTask, translated string) error {
 				if err := stateStore.saveChunk(
 					sourceURL,
@@ -754,6 +773,8 @@ func translateAllChunks(
 	glossaryMap map[string]string,
 	tasks []translationTask,
 	progress io.Writer,
+	workers int,
+	failFast bool,
 	onChunkTranslated func(task translationTask, translated string) error,
 ) ([]pair, error) {
 	if len(tasks) == 0 {
@@ -763,7 +784,7 @@ func translateAllChunks(
 		progress = io.Discard
 	}
 
-	workerCount := defaultTranslateWorkers
+	workerCount := workers
 	if workerCount > len(tasks) {
 		workerCount = len(tasks)
 	}
@@ -795,8 +816,11 @@ func translateAllChunks(
 					case results <- translationResult{task: task, err: fmt.Errorf("translate chunk %d for %s: %w", task.chunkNumber, task.sourceURL, err)}:
 					case <-runCtx.Done():
 					}
-					cancel()
-					return
+					if failFast {
+						cancel()
+						return
+					}
+					continue
 				}
 
 				translated = glossary.Apply(translated, glossaryMap)
