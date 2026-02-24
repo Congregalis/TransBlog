@@ -10,9 +10,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"transblog/internal/chunk"
@@ -27,6 +30,7 @@ const (
 	defaultTranslateWorkers = 4
 	defaultOutDir           = "out"
 	summaryFileName         = "_summary.json"
+	stateFileName           = ".transblog.state.json"
 
 	errorTypeFetch     = "fetch_failed"
 	errorTypeConvert   = "convert_failed"
@@ -78,6 +82,31 @@ type urlOutput struct {
 	outputPath string
 }
 
+type resumeState struct {
+	Version   int                        `json:"version"`
+	UpdatedAt string                     `json:"updated_at"`
+	URLs      map[string]*resumeURLState `json:"urls"`
+}
+
+type resumeURLState struct {
+	FinalURL   string                      `json:"final_url,omitempty"`
+	Title      string                      `json:"title,omitempty"`
+	ChunkCount int                         `json:"chunk_count"`
+	OutputPath string                      `json:"output_path,omitempty"`
+	Completed  bool                        `json:"completed"`
+	Chunks     map[string]resumeChunkState `json:"chunks,omitempty"`
+}
+
+type resumeChunkState struct {
+	Source     string `json:"source"`
+	Translated string `json:"translated"`
+}
+
+type resumeStore struct {
+	path  string
+	state resumeState
+}
+
 type processError struct {
 	errorType string
 	err       error
@@ -88,6 +117,18 @@ func (e *processError) Error() string {
 }
 
 func (e *processError) Unwrap() error {
+	return e.err
+}
+
+type resumePersistError struct {
+	err error
+}
+
+func (e *resumePersistError) Error() string {
+	return e.err.Error()
+}
+
+func (e *resumePersistError) Unwrap() error {
 	return e.err
 }
 
@@ -126,8 +167,15 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return err
 	}
 
+	statePath := filepath.Join(outPlan.summaryDir, stateFileName)
+	stateStore, err := loadResumeStore(statePath)
+	if err != nil {
+		return err
+	}
+
 	openAIClient := openai.NewClient(apiKey, baseURL, httpClient)
-	runCtx := context.Background()
+	runCtx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignal()
 	runStart := time.Now()
 
 	summary := taskSummary{
@@ -142,7 +190,7 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		itemStart := time.Now()
 		item := summaryItem{SourceURL: sourceURL}
 
-		output, err := processURL(runCtx, httpClient, openAIClient, opts, glossaryMap, sourceURL, outPlan, stderr)
+		output, err := processURL(runCtx, httpClient, openAIClient, opts, glossaryMap, sourceURL, outPlan, stateStore, stderr)
 		item.DurationMS = time.Since(itemStart).Milliseconds()
 		if err != nil {
 			errorType, errorMessage := errorDetails(err)
@@ -291,6 +339,143 @@ func prepareOutputPlan(plan outputPlan) error {
 	return nil
 }
 
+func loadResumeStore(path string) (*resumeStore, error) {
+	store := &resumeStore{
+		path: path,
+		state: resumeState{
+			Version: 1,
+			URLs:    map[string]*resumeURLState{},
+		},
+	}
+
+	content, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return store, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read resume state file %s: %w", path, err)
+	}
+
+	if strings.TrimSpace(string(content)) == "" {
+		return store, nil
+	}
+
+	if err := json.Unmarshal(content, &store.state); err != nil {
+		return nil, fmt.Errorf("parse resume state file %s: %w", path, err)
+	}
+	if store.state.URLs == nil {
+		store.state.URLs = map[string]*resumeURLState{}
+	}
+	if store.state.Version == 0 {
+		store.state.Version = 1
+	}
+
+	return store, nil
+}
+
+func (s *resumeStore) prepareURL(sourceURL string, finalURL string, title string, chunkCount int) error {
+	entry := s.ensureURLEntry(sourceURL)
+	if entry.ChunkCount != chunkCount {
+		entry.Chunks = map[string]resumeChunkState{}
+	}
+
+	entry.FinalURL = finalURL
+	entry.Title = title
+	entry.ChunkCount = chunkCount
+	entry.OutputPath = ""
+	entry.Completed = false
+
+	return s.persist()
+}
+
+func (s *resumeStore) loadChunk(sourceURL string, index int, source string, chunkCount int) (string, bool) {
+	entry, ok := s.state.URLs[sourceURL]
+	if !ok || entry == nil {
+		return "", false
+	}
+	if entry.ChunkCount != chunkCount {
+		return "", false
+	}
+
+	chunk, ok := entry.Chunks[strconv.Itoa(index)]
+	if !ok {
+		return "", false
+	}
+	if chunk.Source != source || chunk.Translated == "" {
+		return "", false
+	}
+
+	return chunk.Translated, true
+}
+
+func (s *resumeStore) saveChunk(sourceURL string, finalURL string, title string, chunkCount int, index int, source string, translated string) error {
+	entry := s.ensureURLEntry(sourceURL)
+	if entry.ChunkCount != chunkCount {
+		entry.Chunks = map[string]resumeChunkState{}
+	}
+
+	entry.FinalURL = finalURL
+	entry.Title = title
+	entry.ChunkCount = chunkCount
+	entry.Completed = false
+	if entry.Chunks == nil {
+		entry.Chunks = map[string]resumeChunkState{}
+	}
+	entry.Chunks[strconv.Itoa(index)] = resumeChunkState{
+		Source:     source,
+		Translated: translated,
+	}
+
+	return s.persist()
+}
+
+func (s *resumeStore) markURLComplete(sourceURL string) error {
+	delete(s.state.URLs, sourceURL)
+	return s.persist()
+}
+
+func (s *resumeStore) ensureURLEntry(sourceURL string) *resumeURLState {
+	entry, ok := s.state.URLs[sourceURL]
+	if ok && entry != nil {
+		if entry.Chunks == nil {
+			entry.Chunks = map[string]resumeChunkState{}
+		}
+		return entry
+	}
+
+	entry = &resumeURLState{
+		Chunks: map[string]resumeChunkState{},
+	}
+	s.state.URLs[sourceURL] = entry
+	return entry
+}
+
+func (s *resumeStore) persist() error {
+	if len(s.state.URLs) == 0 {
+		if err := os.Remove(s.path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove resume state file %s: %w", s.path, err)
+		}
+		return nil
+	}
+
+	s.state.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+
+	payload, err := json.MarshalIndent(s.state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal resume state: %w", err)
+	}
+	payload = append(payload, '\n')
+
+	tmpPath := s.path + ".tmp"
+	if err := os.WriteFile(tmpPath, payload, 0o644); err != nil {
+		return fmt.Errorf("write resume state temp file %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		return fmt.Errorf("replace resume state file %s: %w", s.path, err)
+	}
+	return nil
+}
+
 func processURL(
 	ctx context.Context,
 	httpClient *http.Client,
@@ -299,6 +484,7 @@ func processURL(
 	glossaryMap map[string]string,
 	sourceURL string,
 	outPlan outputPlan,
+	stateStore *resumeStore,
 	progress io.Writer,
 ) (urlOutput, error) {
 	doc, err := fetch.HTML(ctx, httpClient, sourceURL)
@@ -327,10 +513,28 @@ func processURL(
 		return urlOutput{}, newProcessError(errorTypeConvert, errors.New("no content after markdown conversion"))
 	}
 
+	if err := stateStore.prepareURL(sourceURL, taskSourceURL, sourceDoc.title, len(chunks)); err != nil {
+		return urlOutput{}, newProcessError(errorTypeOutput, fmt.Errorf("prepare resume state for %s: %w", sourceURL, err))
+	}
+
+	pairs := make([]pair, len(chunks))
+
 	tasks := make([]translationTask, 0, len(chunks))
+	resumedChunkCount := 0
 	for idx, mdChunk := range chunks {
+		if translated, ok := stateStore.loadChunk(sourceURL, idx, mdChunk, len(chunks)); ok {
+			pairs[idx] = pair{
+				sourceURL:   taskSourceURL,
+				sourceTitle: sourceDoc.title,
+				source:      mdChunk,
+				translated:  translated,
+			}
+			resumedChunkCount++
+			continue
+		}
+
 		tasks = append(tasks, translationTask{
-			outputIndex: len(tasks),
+			outputIndex: idx,
 			sourceURL:   taskSourceURL,
 			sourceTitle: sourceDoc.title,
 			sourceChunk: mdChunk,
@@ -339,9 +543,59 @@ func processURL(
 		})
 	}
 
-	pairs, err := translateAllChunks(ctx, openAIClient, opts.Model, glossaryMap, tasks, progress)
-	if err != nil {
-		return urlOutput{}, newProcessError(errorTypeTranslate, err)
+	if resumedChunkCount > 0 {
+		_, _ = fmt.Fprintf(
+			progress,
+			"Resume: reused %d/%d chunks for %s\n",
+			resumedChunkCount,
+			len(chunks),
+			compactURL(taskSourceURL),
+		)
+	}
+
+	if len(tasks) > 0 {
+		translatedPairs, err := translateAllChunks(
+			ctx,
+			openAIClient,
+			opts.Model,
+			glossaryMap,
+			tasks,
+			progress,
+			func(task translationTask, translated string) error {
+				if err := stateStore.saveChunk(
+					sourceURL,
+					taskSourceURL,
+					sourceDoc.title,
+					len(chunks),
+					task.outputIndex,
+					task.sourceChunk,
+					translated,
+				); err != nil {
+					return &resumePersistError{err: fmt.Errorf("save resume chunk %d for %s: %w", task.chunkNumber, sourceURL, err)}
+				}
+				return nil
+			},
+		)
+		if err != nil {
+			var persistErr *resumePersistError
+			if errors.As(err, &persistErr) {
+				return urlOutput{}, newProcessError(errorTypeOutput, persistErr)
+			}
+			return urlOutput{}, newProcessError(errorTypeTranslate, err)
+		}
+
+		for idx, translatedPair := range translatedPairs {
+			if translatedPair.source == "" {
+				continue
+			}
+			pairs[idx] = translatedPair
+		}
+	}
+
+	for idx, p := range pairs {
+		if p.source == "" {
+			return urlOutput{}, newProcessError(errorTypeTranslate, fmt.Errorf("missing translated chunk %d for %s", idx+1, sourceURL))
+		}
 	}
 
 	perURLOpts := opts
@@ -360,6 +614,10 @@ func processURL(
 	}
 	if err := os.WriteFile(outPath, []byte(output.String()), 0o644); err != nil {
 		return urlOutput{}, newProcessError(errorTypeOutput, fmt.Errorf("write output file %s: %w", outPath, err))
+	}
+
+	if err := stateStore.markURLComplete(sourceURL); err != nil {
+		return urlOutput{}, newProcessError(errorTypeOutput, fmt.Errorf("finalize resume state for %s: %w", sourceURL, err))
 	}
 
 	return urlOutput{
@@ -496,6 +754,7 @@ func translateAllChunks(
 	glossaryMap map[string]string,
 	tasks []translationTask,
 	progress io.Writer,
+	onChunkTranslated func(task translationTask, translated string) error,
 ) ([]pair, error) {
 	if len(tasks) == 0 {
 		return nil, nil
@@ -566,7 +825,14 @@ func translateAllChunks(
 		close(results)
 	}()
 
-	pairs := make([]pair, len(tasks))
+	maxOutputIndex := -1
+	for _, task := range tasks {
+		if task.outputIndex > maxOutputIndex {
+			maxOutputIndex = task.outputIndex
+		}
+	}
+
+	pairs := make([]pair, maxOutputIndex+1)
 	completed := 0
 	var firstErr error
 
@@ -584,6 +850,16 @@ func translateAllChunks(
 			sourceTitle: task.sourceTitle,
 			source:      task.sourceChunk,
 			translated:  result.translated,
+		}
+
+		if onChunkTranslated != nil {
+			if err := onChunkTranslated(task, result.translated); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				cancel()
+				continue
+			}
 		}
 
 		completed++

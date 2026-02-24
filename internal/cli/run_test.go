@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -343,6 +345,145 @@ func TestRunSummaryIncludesOutputErrorType(t *testing.T) {
 	}
 }
 
+func TestRunResumeReusesSavedChunksAndMatchesSingleRun(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/long" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleLongArticle("Long Post")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	var phase int32 = 1
+	var phase1Calls int32
+	var phase2Calls int32
+	var phase3Calls int32
+
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		switch atomic.LoadInt32(&phase) {
+		case 1:
+			if atomic.AddInt32(&phase1Calls, 1) == 3 {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"error":{"message":"forced interruption"}}`)
+				return
+			}
+		case 2:
+			atomic.AddInt32(&phase2Calls, 1)
+		case 3:
+			atomic.AddInt32(&phase3Calls, 1)
+		}
+
+		sum := sha1.Sum(body)
+		translated := "译文-" + hex.EncodeToString(sum[:8])
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"`+translated+`"}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	sourceURL := contentServer.URL + "/long"
+
+	resumeDir := t.TempDir()
+	resumedContent := runInWorkingDir(t, resumeDir, func() string {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+
+		firstErr := Run([]string{"--chunk-size", "120", sourceURL}, &stdout, &stderr)
+		if firstErr == nil {
+			t.Fatalf("first Run() error = nil, want interruption failure")
+		}
+
+		statePath := filepath.Join(resumeDir, "out", stateFileName)
+		stateData, err := os.ReadFile(statePath)
+		if err != nil {
+			t.Fatalf("read state file: %v", err)
+		}
+
+		var state resumeState
+		if err := json.Unmarshal(stateData, &state); err != nil {
+			t.Fatalf("unmarshal state file: %v", err)
+		}
+
+		entry := state.URLs[sourceURL]
+		if entry == nil {
+			t.Fatalf("state missing URL entry for %s", sourceURL)
+		}
+		if entry.ChunkCount < 3 {
+			t.Fatalf("chunk_count=%d, want at least 3 for resume test", entry.ChunkCount)
+		}
+		savedChunks := len(entry.Chunks)
+		if savedChunks == 0 || savedChunks >= entry.ChunkCount {
+			t.Fatalf("saved chunk count=%d, want in (0,%d)", savedChunks, entry.ChunkCount)
+		}
+
+		atomic.StoreInt32(&phase, 2)
+		stdout.Reset()
+		stderr.Reset()
+
+		if err := Run([]string{"--chunk-size", "120", sourceURL}, &stdout, &stderr); err != nil {
+			t.Fatalf("second Run() error = %v; stderr=%s", err, stderr.String())
+		}
+
+		if got, want := int(atomic.LoadInt32(&phase2Calls)), entry.ChunkCount-savedChunks; got != want {
+			t.Fatalf("resume API calls=%d, want %d (chunk_count=%d saved=%d)", got, want, entry.ChunkCount, savedChunks)
+		}
+
+		filename, err := filenameFromURL(sourceURL, false)
+		if err != nil {
+			t.Fatalf("filenameFromURL: %v", err)
+		}
+		outputPath := filepath.Join(resumeDir, "out", filename)
+		outputData, err := os.ReadFile(outputPath)
+		if err != nil {
+			t.Fatalf("read resumed output: %v", err)
+		}
+
+		if _, err := os.Stat(statePath); !os.IsNotExist(err) {
+			t.Fatalf("state file should be removed after completion, stat err=%v", err)
+		}
+		return string(outputData)
+	})
+
+	atomic.StoreInt32(&phase, 3)
+
+	baselineDir := t.TempDir()
+	baselineContent := runInWorkingDir(t, baselineDir, func() string {
+		var stdout bytes.Buffer
+		var stderr bytes.Buffer
+		if err := Run([]string{"--chunk-size", "120", sourceURL}, &stdout, &stderr); err != nil {
+			t.Fatalf("baseline Run() error = %v; stderr=%s", err, stderr.String())
+		}
+
+		filename, err := filenameFromURL(sourceURL, false)
+		if err != nil {
+			t.Fatalf("filenameFromURL: %v", err)
+		}
+		outputPath := filepath.Join(baselineDir, "out", filename)
+		outputData, err := os.ReadFile(outputPath)
+		if err != nil {
+			t.Fatalf("read baseline output: %v", err)
+		}
+		return string(outputData)
+	})
+
+	if resumedContent != baselineContent {
+		t.Fatalf("resumed output differs from one-shot output")
+	}
+	if atomic.LoadInt32(&phase3Calls) == 0 {
+		t.Fatalf("expected baseline run to call OpenAI at least once")
+	}
+}
+
 func useTempWorkingDir(t *testing.T) string {
 	t.Helper()
 
@@ -362,6 +503,46 @@ func useTempWorkingDir(t *testing.T) string {
 	return tmpDir
 }
 
+func runInWorkingDir(t *testing.T, dir string, fn func() string) string {
+	t.Helper()
+
+	originalDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatalf("Chdir(%q): %v", dir, err)
+	}
+	defer func() {
+		_ = os.Chdir(originalDir)
+	}()
+
+	return fn()
+}
+
 func sampleArticle(title string, text string) string {
 	return "<!doctype html><html><head><title>" + title + "</title></head><body><article><h1>" + title + "</h1><p>" + text + " paragraph with enough length for readability extraction.</p></article></body></html>"
+}
+
+func sampleLongArticle(title string) string {
+	paragraphs := []string{
+		"This is the first long paragraph to force markdown chunking and resume behavior verification for the CLI test suite.",
+		"This is the second long paragraph with extra descriptive words so the chunk splitter has enough material to cut into multiple segments.",
+		"This is the third long paragraph that continues the sequence and helps us validate deterministic output across resumed and single-pass runs.",
+		"This is the fourth long paragraph to ensure there are more chunks than one worker request, making partial completion observable.",
+	}
+
+	var b strings.Builder
+	b.WriteString("<!doctype html><html><head><title>")
+	b.WriteString(title)
+	b.WriteString("</title></head><body><article><h1>")
+	b.WriteString(title)
+	b.WriteString("</h1>")
+	for _, p := range paragraphs {
+		b.WriteString("<p>")
+		b.WriteString(p)
+		b.WriteString("</p>")
+	}
+	b.WriteString("</article></body></html>")
+	return b.String()
 }
