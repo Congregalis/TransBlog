@@ -93,6 +93,53 @@ func TestHTMLFallsBackToOriginalBodyWhenExtractionFails(t *testing.T) {
 	}
 }
 
+func TestHTMLReturnsStatusErrorWithBodySnippet(t *testing.T) {
+	t.Parallel()
+
+	const errBody = "missing page"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(errBody))
+	}))
+	t.Cleanup(server.Close)
+
+	httpClient := server.Client()
+	httpClient.Timeout = 5 * time.Second
+
+	_, err := HTML(context.Background(), httpClient, server.URL)
+	if err == nil {
+		t.Fatalf("HTML() error = nil, want status error")
+	}
+	if !strings.Contains(err.Error(), "unexpected status 404") {
+		t.Fatalf("HTML() error = %v, want status details", err)
+	}
+	if !strings.Contains(err.Error(), errBody) {
+		t.Fatalf("HTML() error = %v, want body snippet %q", err, errBody)
+	}
+}
+
+func TestHTMLReturnsTimeoutError(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(200 * time.Millisecond)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte("<html><head><title>slow</title></head><body>slow</body></html>"))
+	}))
+	t.Cleanup(server.Close)
+
+	httpClient := server.Client()
+	httpClient.Timeout = 50 * time.Millisecond
+
+	_, err := HTML(context.Background(), httpClient, server.URL)
+	if err == nil {
+		t.Fatalf("HTML() error = nil, want timeout")
+	}
+	if !strings.Contains(err.Error(), "download URL") {
+		t.Fatalf("HTML() error = %v, want wrapped download error", err)
+	}
+}
+
 func TestExtractTitle(t *testing.T) {
 	t.Parallel()
 

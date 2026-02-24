@@ -32,8 +32,21 @@ jobs:
       - name: Vet
         run: go vet ./...
 
-      - name: Test
-        run: go test ./...
+      - name: Unit test + coverage
+        run: |
+          go list ./... | grep -v '^transblog/e2e$' | xargs go test -covermode=atomic -coverprofile=coverage.out
+
+          TOTAL=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
+          THRESHOLD=45
+          awk -v total="$TOTAL" -v threshold="$THRESHOLD" 'BEGIN {
+            if ((total + 0) < threshold) {
+              printf("coverage %.2f%% is below threshold %d%%\n", total + 0, threshold)
+              exit 1
+            }
+          }'
+
+      - name: Integration tests (e2e)
+        run: go test ./e2e -count=1
 
       - name: Build
         run: go build ./cmd/transblog
