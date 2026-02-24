@@ -38,20 +38,23 @@ const (
 	errorTypeTranslate = "translate_failed"
 	errorTypeOutput    = "output_failed"
 	errorTypeUnknown   = "unknown"
+
+	defaultQualityRetries = 1
 )
 
 type options struct {
-	Model      string
-	OutPath    string
-	View       bool
-	Workers    int
-	MaxRetries int
-	FailFast   bool
-	Glossary   string
-	Timeout    time.Duration
-	ChunkSize  int
-	ShowHelp   bool
-	SourceURLs []string
+	Model       string
+	OutPath     string
+	View        bool
+	Workers     int
+	MaxRetries  int
+	FailFast    bool
+	PriceConfig string
+	Glossary    string
+	Timeout     time.Duration
+	ChunkSize   int
+	ShowHelp    bool
+	SourceURLs  []string
 }
 
 type outputPlan struct {
@@ -61,29 +64,81 @@ type outputPlan struct {
 }
 
 type summaryItem struct {
-	SourceURL    string `json:"source_url"`
-	FinalURL     string `json:"final_url,omitempty"`
-	Success      bool   `json:"success"`
-	DurationMS   int64  `json:"duration_ms"`
-	OutputPath   string `json:"output_path,omitempty"`
-	ErrorType    string `json:"error_type,omitempty"`
-	ErrorMessage string `json:"error_message,omitempty"`
+	SourceURL            string  `json:"source_url"`
+	FinalURL             string  `json:"final_url,omitempty"`
+	Success              bool    `json:"success"`
+	DurationMS           int64   `json:"duration_ms"`
+	OutputPath           string  `json:"output_path,omitempty"`
+	QualityFallbackCount int     `json:"quality_fallback_count,omitempty"`
+	InputTokens          int64   `json:"input_tokens,omitempty"`
+	OutputTokens         int64   `json:"output_tokens,omitempty"`
+	TotalTokens          int64   `json:"total_tokens,omitempty"`
+	MissingUsageCount    int     `json:"missing_usage_count,omitempty"`
+	CostEstimate         float64 `json:"cost_estimate,omitempty"`
+	CostEstimateModel    string  `json:"cost_estimate_model,omitempty"`
+	CostEstimatePartial  bool    `json:"cost_estimate_partial,omitempty"`
+	ErrorType            string  `json:"error_type,omitempty"`
+	ErrorMessage         string  `json:"error_message,omitempty"`
 }
 
 type taskSummary struct {
-	GeneratedAt     string        `json:"generated_at"`
-	Model           string        `json:"model"`
-	View            bool          `json:"view"`
-	TotalURLs       int           `json:"total_urls"`
-	SuccessCount    int           `json:"success_count"`
-	FailureCount    int           `json:"failure_count"`
-	TotalDurationMS int64         `json:"total_duration_ms"`
-	Results         []summaryItem `json:"results"`
+	GeneratedAt               string        `json:"generated_at"`
+	Model                     string        `json:"model"`
+	View                      bool          `json:"view"`
+	TotalURLs                 int           `json:"total_urls"`
+	SuccessCount              int           `json:"success_count"`
+	FailureCount              int           `json:"failure_count"`
+	TotalDurationMS           int64         `json:"total_duration_ms"`
+	QualityFallbackTotalCount int           `json:"quality_fallback_total_count,omitempty"`
+	InputTokens               int64         `json:"input_tokens,omitempty"`
+	OutputTokens              int64         `json:"output_tokens,omitempty"`
+	TotalTokens               int64         `json:"total_tokens,omitempty"`
+	MissingUsageCount         int           `json:"missing_usage_count,omitempty"`
+	CostEstimate              float64       `json:"cost_estimate,omitempty"`
+	CostEstimateModel         string        `json:"cost_estimate_model,omitempty"`
+	CostEstimatePartial       bool          `json:"cost_estimate_partial,omitempty"`
+	Results                   []summaryItem `json:"results"`
 }
 
 type urlOutput struct {
-	finalURL   string
-	outputPath string
+	finalURL             string
+	outputPath           string
+	qualityFallbackCount int
+	usage                usageStats
+	costEstimate         float64
+	costEstimated        bool
+}
+
+type usageStats struct {
+	inputTokens       int64
+	outputTokens      int64
+	totalTokens       int64
+	missingUsageCount int
+}
+
+type priceConfig map[string]modelPrice
+
+type modelPrice struct {
+	InputPerMillion  float64 `json:"input_per_million"`
+	OutputPerMillion float64 `json:"output_per_million"`
+	TotalPerMillion  float64 `json:"total_per_million"`
+}
+
+func (u *usageStats) add(other usageStats) {
+	u.inputTokens += other.inputTokens
+	u.outputTokens += other.outputTokens
+	u.totalTokens += other.totalTokens
+	u.missingUsageCount += other.missingUsageCount
+}
+
+func (u *usageStats) addOpenAIUsage(usage openai.Usage) {
+	if usage.Available {
+		u.inputTokens += usage.InputTokens
+		u.outputTokens += usage.OutputTokens
+		u.totalTokens += usage.TotalTokens
+		return
+	}
+	u.missingUsageCount++
 }
 
 type resumeState struct {
@@ -112,8 +167,13 @@ type resumeStore struct {
 }
 
 type processError struct {
-	errorType string
-	err       error
+	errorType            string
+	qualityFallbackCount int
+	usage                usageStats
+	costEstimate         float64
+	costEstimated        bool
+	costEstimatePartial  bool
+	err                  error
 }
 
 func (e *processError) Error() string {
@@ -163,6 +223,11 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return err
 	}
 
+	prices, err := loadPriceConfig(opts.PriceConfig)
+	if err != nil {
+		return err
+	}
+
 	outPlan, err := buildOutputPlan(opts)
 	if err != nil {
 		return err
@@ -194,14 +259,36 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		itemStart := time.Now()
 		item := summaryItem{SourceURL: sourceURL}
 
-		output, err := processURL(runCtx, httpClient, openAIClient, opts, glossaryMap, sourceURL, outPlan, stateStore, stderr)
+		output, err := processURL(runCtx, httpClient, openAIClient, opts, glossaryMap, prices, sourceURL, outPlan, stateStore, stderr)
 		item.DurationMS = time.Since(itemStart).Milliseconds()
 		if err != nil {
-			errorType, errorMessage := errorDetails(err)
+			errorType, errorMessage, fallbackCount, failureUsage, failureCost, failureCostEstimated, failureCostPartial := errorDetails(err)
 			item.Success = false
 			item.ErrorType = errorType
 			item.ErrorMessage = errorMessage
+			item.QualityFallbackCount = fallbackCount
+			item.InputTokens = failureUsage.inputTokens
+			item.OutputTokens = failureUsage.outputTokens
+			item.TotalTokens = failureUsage.totalTokens
+			item.MissingUsageCount = failureUsage.missingUsageCount
+			if failureCostEstimated {
+				item.CostEstimate = failureCost
+				item.CostEstimateModel = opts.Model
+				item.CostEstimatePartial = failureCostPartial
+			}
 			summary.FailureCount++
+			summary.QualityFallbackTotalCount += fallbackCount
+			summary.InputTokens += failureUsage.inputTokens
+			summary.OutputTokens += failureUsage.outputTokens
+			summary.TotalTokens += failureUsage.totalTokens
+			summary.MissingUsageCount += failureUsage.missingUsageCount
+			if failureCostEstimated {
+				summary.CostEstimate += failureCost
+				summary.CostEstimateModel = opts.Model
+				if failureCostPartial {
+					summary.CostEstimatePartial = true
+				}
+			}
 			summary.Results = append(summary.Results, item)
 			_, _ = fmt.Fprintf(stderr, "Failed [%s]: %s (%s)\n", errorType, compactURL(sourceURL), errorMessage)
 			if opts.FailFast {
@@ -214,7 +301,29 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		item.Success = true
 		item.FinalURL = output.finalURL
 		item.OutputPath = output.outputPath
+		item.QualityFallbackCount = output.qualityFallbackCount
+		item.InputTokens = output.usage.inputTokens
+		item.OutputTokens = output.usage.outputTokens
+		item.TotalTokens = output.usage.totalTokens
+		item.MissingUsageCount = output.usage.missingUsageCount
+		if output.costEstimated {
+			item.CostEstimate = output.costEstimate
+			item.CostEstimateModel = opts.Model
+			item.CostEstimatePartial = output.usage.missingUsageCount > 0
+		}
 		summary.SuccessCount++
+		summary.QualityFallbackTotalCount += output.qualityFallbackCount
+		summary.InputTokens += output.usage.inputTokens
+		summary.OutputTokens += output.usage.outputTokens
+		summary.TotalTokens += output.usage.totalTokens
+		summary.MissingUsageCount += output.usage.missingUsageCount
+		if output.costEstimated {
+			summary.CostEstimate += output.costEstimate
+			summary.CostEstimateModel = opts.Model
+			if output.usage.missingUsageCount > 0 {
+				summary.CostEstimatePartial = true
+			}
+		}
 		summary.Results = append(summary.Results, item)
 
 		_, _ = fmt.Fprintf(stdout, "Output: %s\n", output.outputPath)
@@ -239,6 +348,29 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		time.Duration(summary.TotalDurationMS)*time.Millisecond,
 	)
 
+	if summary.InputTokens > 0 || summary.OutputTokens > 0 || summary.TotalTokens > 0 {
+		_, _ = fmt.Fprintf(
+			stdout,
+			"Usage: input=%d output=%d total=%d tokens\n",
+			summary.InputTokens,
+			summary.OutputTokens,
+			summary.TotalTokens,
+		)
+	}
+	if summary.MissingUsageCount > 0 {
+		_, _ = fmt.Fprintf(
+			stderr,
+			"Usage info missing for %d chunk(s); totals may be partial.\n",
+			summary.MissingUsageCount,
+		)
+	}
+	if summary.CostEstimateModel != "" {
+		_, _ = fmt.Fprintf(stdout, "Estimated cost (%s): $%.6f\n", summary.CostEstimateModel, summary.CostEstimate)
+		if summary.CostEstimatePartial {
+			_, _ = fmt.Fprintln(stderr, "Cost estimate is partial due to missing usage data.")
+		}
+	}
+
 	if summary.FailureCount > 0 {
 		return fmt.Errorf("%d URL(s) failed", summary.FailureCount)
 	}
@@ -256,6 +388,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.IntVar(&opts.Workers, "workers", defaultTranslateWorkers, "Translation worker count")
 	fs.IntVar(&opts.MaxRetries, "max-retries", defaultMaxRetries, "Maximum retries for OpenAI requests")
 	fs.BoolVar(&opts.FailFast, "fail-fast", false, "Stop at first URL failure (default: continue for partial success)")
+	fs.StringVar(&opts.PriceConfig, "price-config", "", "Optional JSON pricing config file for cost estimation")
 	fs.StringVar(&opts.Glossary, "glossary", "", "Path to glossary JSON map, e.g. {\"term\":\"translation\"}")
 	fs.DurationVar(&opts.Timeout, "timeout", 90*time.Second, "HTTP timeout, e.g. 120s")
 	fs.IntVar(&opts.ChunkSize, "chunk-size", defaultChunkSize, "Target chunk size in characters")
@@ -354,6 +487,49 @@ func prepareOutputPlan(plan outputPlan) error {
 	}
 
 	return nil
+}
+
+func loadPriceConfig(path string) (priceConfig, error) {
+	if strings.TrimSpace(path) == "" {
+		return nil, nil
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read price config %s: %w", path, err)
+	}
+
+	var cfg priceConfig
+	if err := json.Unmarshal(content, &cfg); err != nil {
+		return nil, fmt.Errorf("parse price config %s: %w", path, err)
+	}
+
+	return cfg, nil
+}
+
+func estimateCost(usage usageStats, cfg priceConfig, model string) (cost float64, estimated bool, partial bool) {
+	if cfg == nil {
+		return 0, false, false
+	}
+
+	price, ok := cfg[model]
+	if !ok {
+		price, ok = cfg["default"]
+		if !ok {
+			return 0, false, false
+		}
+	}
+
+	if price.InputPerMillion > 0 || price.OutputPerMillion > 0 {
+		cost = float64(usage.inputTokens)*price.InputPerMillion/1_000_000.0 +
+			float64(usage.outputTokens)*price.OutputPerMillion/1_000_000.0
+	} else if price.TotalPerMillion > 0 {
+		cost = float64(usage.totalTokens) * price.TotalPerMillion / 1_000_000.0
+	} else {
+		return 0, false, false
+	}
+
+	return cost, true, usage.missingUsageCount > 0
 }
 
 func loadResumeStore(path string) (*resumeStore, error) {
@@ -499,6 +675,7 @@ func processURL(
 	openAIClient *openai.Client,
 	opts options,
 	glossaryMap map[string]string,
+	prices priceConfig,
 	sourceURL string,
 	outPlan outputPlan,
 	stateStore *resumeStore,
@@ -570,8 +747,10 @@ func processURL(
 		)
 	}
 
+	urlQualityFallbackCount := 0
+	urlUsage := usageStats{}
 	if len(tasks) > 0 {
-		translatedPairs, err := translateAllChunks(
+		translatedPairs, qualityFallbackCount, translatedUsage, err := translateAllChunks(
 			ctx,
 			openAIClient,
 			opts.Model,
@@ -598,9 +777,21 @@ func processURL(
 		if err != nil {
 			var persistErr *resumePersistError
 			if errors.As(err, &persistErr) {
-				return urlOutput{}, newProcessError(errorTypeOutput, persistErr)
+				return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, persistErr, qualityFallbackCount, translatedUsage, 0, false, false)
 			}
-			return urlOutput{}, newProcessError(errorTypeTranslate, err)
+			cost, costEstimated, costPartial := estimateCost(translatedUsage, prices, opts.Model)
+			return urlOutput{}, newProcessErrorWithDetails(errorTypeTranslate, err, qualityFallbackCount, translatedUsage, cost, costEstimated, costPartial)
+		}
+
+		urlQualityFallbackCount = qualityFallbackCount
+		urlUsage = translatedUsage
+		if qualityFallbackCount > 0 {
+			_, _ = fmt.Fprintf(
+				progress,
+				"Quality fallback: triggered %d time(s) for %s\n",
+				qualityFallbackCount,
+				compactURL(taskSourceURL),
+			)
 		}
 
 		for idx, translatedPair := range translatedPairs {
@@ -627,21 +818,27 @@ func processURL(
 		writeMarkdown(&output, pairs, perURLOpts)
 	}
 
+	cost, costEstimated, costPartial := estimateCost(urlUsage, prices, opts.Model)
+
 	outPath, err := outputPathForURL(outPlan, taskSourceURL, opts.View)
 	if err != nil {
-		return urlOutput{}, newProcessError(errorTypeOutput, err)
+		return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, err, urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
 	}
 	if err := os.WriteFile(outPath, []byte(output.String()), 0o644); err != nil {
-		return urlOutput{}, newProcessError(errorTypeOutput, fmt.Errorf("write output file %s: %w", outPath, err))
+		return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, fmt.Errorf("write output file %s: %w", outPath, err), urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
 	}
 
 	if err := stateStore.markURLComplete(sourceURL); err != nil {
-		return urlOutput{}, newProcessError(errorTypeOutput, fmt.Errorf("finalize resume state for %s: %w", sourceURL, err))
+		return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, fmt.Errorf("finalize resume state for %s: %w", sourceURL, err), urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
 	}
 
 	return urlOutput{
-		finalURL:   taskSourceURL,
-		outputPath: outPath,
+		finalURL:             taskSourceURL,
+		outputPath:           outPath,
+		qualityFallbackCount: urlQualityFallbackCount,
+		usage:                urlUsage,
+		costEstimate:         cost,
+		costEstimated:        costEstimated,
 	}, nil
 }
 
@@ -719,26 +916,57 @@ func writeSummary(path string, summary taskSummary) error {
 }
 
 func newProcessError(errorType string, err error) error {
+	return newProcessErrorWithDetails(errorType, err, 0, usageStats{}, 0, false, false)
+}
+
+func newProcessErrorWithDetails(
+	errorType string,
+	err error,
+	qualityFallbackCount int,
+	usage usageStats,
+	costEstimate float64,
+	costEstimated bool,
+	costEstimatePartial bool,
+) error {
 	if err == nil {
 		return nil
 	}
 	return &processError{
-		errorType: errorType,
-		err:       err,
+		errorType:            errorType,
+		qualityFallbackCount: qualityFallbackCount,
+		usage:                usage,
+		costEstimate:         costEstimate,
+		costEstimated:        costEstimated,
+		costEstimatePartial:  costEstimatePartial,
+		err:                  err,
 	}
 }
 
-func errorDetails(err error) (errorType string, errorMessage string) {
+func errorDetails(err error) (
+	errorType string,
+	errorMessage string,
+	qualityFallbackCount int,
+	usage usageStats,
+	costEstimate float64,
+	costEstimated bool,
+	costEstimatePartial bool,
+) {
 	if err == nil {
-		return "", ""
+		return "", "", 0, usageStats{}, 0, false, false
 	}
 
 	var stageErr *processError
 	if errors.As(err, &stageErr) {
-		return stageErr.errorType, stageErr.err.Error()
+		return stageErr.errorType,
+			stageErr.err.Error(),
+			stageErr.qualityFallbackCount,
+			stageErr.usage,
+			stageErr.costEstimate,
+			stageErr.costEstimated,
+			stageErr.costEstimatePartial
 	}
 
-	return errorTypeUnknown, err.Error()
+	return errorTypeUnknown, err.Error(), 0, usageStats{}, 0, false, false
 }
 
 func optsStartTime(start time.Time) string {
@@ -761,9 +989,11 @@ type translationTask struct {
 }
 
 type translationResult struct {
-	task       translationTask
-	translated string
-	err        error
+	task                 translationTask
+	translated           string
+	qualityFallbackCount int
+	usage                usageStats
+	err                  error
 }
 
 func translateAllChunks(
@@ -776,9 +1006,9 @@ func translateAllChunks(
 	workers int,
 	failFast bool,
 	onChunkTranslated func(task translationTask, translated string) error,
-) ([]pair, error) {
+) ([]pair, int, usageStats, error) {
 	if len(tasks) == 0 {
-		return nil, nil
+		return nil, 0, usageStats{}, nil
 	}
 	if progress == nil {
 		progress = io.Discard
@@ -810,10 +1040,21 @@ func translateAllChunks(
 					return
 				}
 
-				translated, err := client.TranslateMarkdownChunk(runCtx, model, task.sourceChunk, glossaryMap)
+				translated, chunkUsage, fallbackCount, err := translateChunkWithQualityGuard(
+					runCtx,
+					client,
+					model,
+					task.sourceChunk,
+					glossaryMap,
+				)
 				if err != nil {
 					select {
-					case results <- translationResult{task: task, err: fmt.Errorf("translate chunk %d for %s: %w", task.chunkNumber, task.sourceURL, err)}:
+					case results <- translationResult{
+						task:                 task,
+						qualityFallbackCount: fallbackCount,
+						usage:                chunkUsage,
+						err:                  fmt.Errorf("translate chunk %d for %s: %w", task.chunkNumber, task.sourceURL, err),
+					}:
 					case <-runCtx.Done():
 					}
 					if failFast {
@@ -822,10 +1063,13 @@ func translateAllChunks(
 					}
 					continue
 				}
-
-				translated = glossary.Apply(translated, glossaryMap)
 				select {
-				case results <- translationResult{task: task, translated: translated}:
+				case results <- translationResult{
+					task:                 task,
+					translated:           translated,
+					qualityFallbackCount: fallbackCount,
+					usage:                chunkUsage,
+				}:
 				case <-runCtx.Done():
 					return
 				}
@@ -858,10 +1102,14 @@ func translateAllChunks(
 
 	pairs := make([]pair, maxOutputIndex+1)
 	completed := 0
+	qualityFallbackCount := 0
+	totalUsage := usageStats{}
 	var firstErr error
 
 	for result := range results {
+		totalUsage.add(result.usage)
 		if result.err != nil {
+			qualityFallbackCount += result.qualityFallbackCount
 			if firstErr == nil {
 				firstErr = result.err
 			}
@@ -886,6 +1134,7 @@ func translateAllChunks(
 			}
 		}
 
+		qualityFallbackCount += result.qualityFallbackCount
 		completed++
 		percent := completed * 100 / len(tasks)
 		_, _ = fmt.Fprintf(
@@ -901,11 +1150,241 @@ func translateAllChunks(
 	}
 
 	if firstErr != nil {
-		return nil, firstErr
+		return nil, qualityFallbackCount, totalUsage, firstErr
 	}
 
 	_, _ = fmt.Fprintf(progress, "Translation complete: %d chunks.\n", completed)
-	return pairs, nil
+	return pairs, qualityFallbackCount, totalUsage, nil
+}
+
+func translateChunkWithQualityGuard(
+	ctx context.Context,
+	client *openai.Client,
+	model string,
+	sourceChunk string,
+	glossaryMap map[string]string,
+) (string, usageStats, int, error) {
+	totalUsage := usageStats{}
+
+	translated, usage, err := client.TranslateMarkdownChunkWithUsage(ctx, model, sourceChunk, glossaryMap)
+	if err != nil {
+		return "", totalUsage, 0, err
+	}
+	totalUsage.addOpenAIUsage(usage)
+	translated = glossary.Apply(translated, glossaryMap)
+
+	if err := validateTranslatedChunk(sourceChunk, translated); err == nil {
+		return translated, totalUsage, 0, nil
+	} else {
+		lastValidationErr := err
+		fallbackCount := 0
+
+		for retry := 0; retry < defaultQualityRetries; retry++ {
+			fallbackCount++
+
+			strictTranslated, strictUsage, strictErr := client.TranslateMarkdownChunkStrictWithUsage(
+				ctx,
+				model,
+				sourceChunk,
+				glossaryMap,
+				lastValidationErr.Error(),
+			)
+			if strictErr != nil {
+				return "", totalUsage, fallbackCount, fmt.Errorf("strict quality retry failed: %w", strictErr)
+			}
+			totalUsage.addOpenAIUsage(strictUsage)
+
+			strictTranslated = glossary.Apply(strictTranslated, glossaryMap)
+			if validationErr := validateTranslatedChunk(sourceChunk, strictTranslated); validationErr == nil {
+				return strictTranslated, totalUsage, fallbackCount, nil
+			} else {
+				lastValidationErr = validationErr
+			}
+		}
+
+		return "", totalUsage, fallbackCount, fmt.Errorf("translated markdown failed quality validation: %w", lastValidationErr)
+	}
+}
+
+func validateTranslatedChunk(source string, translated string) error {
+	if strings.TrimSpace(translated) == "" {
+		return errors.New("empty translated markdown")
+	}
+
+	if err := validateFenceBalance(translated); err != nil {
+		return err
+	}
+
+	sourceShape := markdownShapeFromText(source)
+	translatedShape := markdownShapeFromText(translated)
+	if err := validateMarkdownShape(sourceShape, translatedShape); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type markdownShape struct {
+	headings      int
+	unorderedList int
+	orderedList   int
+	blockquote    int
+	tableRows     int
+}
+
+func markdownShapeFromText(markdownText string) markdownShape {
+	lines := strings.Split(markdownText, "\n")
+
+	var shape markdownShape
+	inFence := false
+	fenceMarker := byte(0)
+	fenceLen := 0
+
+	for _, rawLine := range lines {
+		trimmed := strings.TrimSpace(rawLine)
+		if trimmed == "" {
+			continue
+		}
+
+		if marker, markerLen, ok := parseFenceMarker(trimmed); ok {
+			if !inFence {
+				inFence = true
+				fenceMarker = marker
+				fenceLen = markerLen
+			} else if marker == fenceMarker && markerLen >= fenceLen {
+				inFence = false
+				fenceMarker = 0
+				fenceLen = 0
+			}
+			continue
+		}
+		if inFence {
+			continue
+		}
+
+		if isHeadingLine(trimmed) {
+			shape.headings++
+		}
+		if isUnorderedListLine(trimmed) {
+			shape.unorderedList++
+		}
+		if isOrderedListLine(trimmed) {
+			shape.orderedList++
+		}
+		if strings.HasPrefix(trimmed, ">") {
+			shape.blockquote++
+		}
+		if strings.Count(trimmed, "|") >= 2 {
+			shape.tableRows++
+		}
+	}
+
+	return shape
+}
+
+func validateMarkdownShape(source markdownShape, translated markdownShape) error {
+	if source.headings > 0 && translated.headings == 0 {
+		return fmt.Errorf("missing headings: source=%d translated=%d", source.headings, translated.headings)
+	}
+	if source.blockquote > 0 && translated.blockquote == 0 {
+		return fmt.Errorf("missing blockquote: source=%d translated=%d", source.blockquote, translated.blockquote)
+	}
+	if source.tableRows > 1 && translated.tableRows == 0 {
+		return fmt.Errorf("missing table rows: source=%d translated=%d", source.tableRows, translated.tableRows)
+	}
+
+	sourceListTotal := source.unorderedList + source.orderedList
+	translatedListTotal := translated.unorderedList + translated.orderedList
+	if sourceListTotal >= 3 && translatedListTotal < sourceListTotal/2 {
+		return fmt.Errorf("list structure collapsed: source=%d translated=%d", sourceListTotal, translatedListTotal)
+	}
+	if sourceListTotal > 0 && translatedListTotal == 0 {
+		return fmt.Errorf("missing list structure: source=%d translated=%d", sourceListTotal, translatedListTotal)
+	}
+
+	return nil
+}
+
+func validateFenceBalance(markdownText string) error {
+	lines := strings.Split(markdownText, "\n")
+	inFence := false
+	fenceMarker := byte(0)
+	fenceLen := 0
+
+	for _, rawLine := range lines {
+		trimmed := strings.TrimSpace(rawLine)
+		if marker, markerLen, ok := parseFenceMarker(trimmed); ok {
+			if !inFence {
+				inFence = true
+				fenceMarker = marker
+				fenceLen = markerLen
+			} else if marker == fenceMarker && markerLen >= fenceLen {
+				inFence = false
+				fenceMarker = 0
+				fenceLen = 0
+			}
+		}
+	}
+
+	if inFence {
+		return errors.New("unbalanced fenced code block")
+	}
+	return nil
+}
+
+func parseFenceMarker(line string) (byte, int, bool) {
+	if len(line) < 3 {
+		return 0, 0, false
+	}
+
+	switch line[0] {
+	case '`', '~':
+		marker := line[0]
+		count := 0
+		for count < len(line) && line[count] == marker {
+			count++
+		}
+		if count >= 3 {
+			return marker, count, true
+		}
+	}
+
+	return 0, 0, false
+}
+
+func isHeadingLine(trimmed string) bool {
+	if !strings.HasPrefix(trimmed, "#") {
+		return false
+	}
+	if len(trimmed) == 1 {
+		return true
+	}
+	return trimmed[1] == ' '
+}
+
+func isUnorderedListLine(trimmed string) bool {
+	if len(trimmed) < 2 {
+		return false
+	}
+	switch trimmed[0] {
+	case '-', '*', '+':
+		return trimmed[1] == ' '
+	default:
+		return false
+	}
+}
+
+func isOrderedListLine(trimmed string) bool {
+	dot := strings.IndexByte(trimmed, '.')
+	if dot <= 0 || dot+1 >= len(trimmed) {
+		return false
+	}
+	for i := 0; i < dot; i++ {
+		if trimmed[i] < '0' || trimmed[i] > '9' {
+			return false
+		}
+	}
+	return trimmed[dot+1] == ' '
 }
 
 func compactURL(rawURL string) string {

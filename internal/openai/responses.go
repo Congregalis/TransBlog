@@ -29,6 +29,13 @@ type Client struct {
 	maxRetries int
 }
 
+type Usage struct {
+	InputTokens  int64
+	OutputTokens int64
+	TotalTokens  int64
+	Available    bool
+}
+
 func NewClient(apiKey string, baseURL string, httpClient *http.Client, maxRetries int) *Client {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultBaseURL
@@ -50,15 +57,50 @@ func NewClient(apiKey string, baseURL string, httpClient *http.Client, maxRetrie
 }
 
 func (c *Client) TranslateMarkdownChunk(ctx context.Context, model string, mdChunk string, glossaryMap map[string]string) (string, error) {
-	systemPrompt := strings.Join([]string{
-		"Translate English Markdown to Simplified Chinese.",
-		"Preserve Markdown layout and syntax exactly.",
-		"Do not translate code fences, inline code, or URLs.",
-		"Keep link targets unchanged.",
-		"Return only translated Markdown with no commentary.",
-	}, " ")
+	translated, _, err := c.TranslateMarkdownChunkWithUsage(ctx, model, mdChunk, glossaryMap)
+	return translated, err
+}
 
-	userPrompt := buildUserPrompt(mdChunk, glossaryMap)
+func (c *Client) TranslateMarkdownChunkWithUsage(
+	ctx context.Context,
+	model string,
+	mdChunk string,
+	glossaryMap map[string]string,
+) (string, Usage, error) {
+	return c.translateMarkdownChunk(ctx, model, mdChunk, glossaryMap, false, "")
+}
+
+func (c *Client) TranslateMarkdownChunkStrict(
+	ctx context.Context,
+	model string,
+	mdChunk string,
+	glossaryMap map[string]string,
+	failureReason string,
+) (string, error) {
+	translated, _, err := c.TranslateMarkdownChunkStrictWithUsage(ctx, model, mdChunk, glossaryMap, failureReason)
+	return translated, err
+}
+
+func (c *Client) TranslateMarkdownChunkStrictWithUsage(
+	ctx context.Context,
+	model string,
+	mdChunk string,
+	glossaryMap map[string]string,
+	failureReason string,
+) (string, Usage, error) {
+	return c.translateMarkdownChunk(ctx, model, mdChunk, glossaryMap, true, failureReason)
+}
+
+func (c *Client) translateMarkdownChunk(
+	ctx context.Context,
+	model string,
+	mdChunk string,
+	glossaryMap map[string]string,
+	strict bool,
+	failureReason string,
+) (string, Usage, error) {
+	systemPrompt := buildSystemPrompt(strict)
+	userPrompt := buildUserPrompt(mdChunk, glossaryMap, strict, failureReason)
 
 	// Build input array for the new API format
 	payload := map[string]any{
@@ -89,14 +131,14 @@ func (c *Client) TranslateMarkdownChunk(ctx context.Context, model string, mdChu
 
 	body, err := json.Marshal(payload)
 	if err != nil {
-		return "", fmt.Errorf("marshal OpenAI request: %w", err)
+		return "", Usage{}, fmt.Errorf("marshal OpenAI request: %w", err)
 	}
 
 	var lastErr error
 	for attempt := 0; attempt <= c.maxRetries; attempt++ {
-		translated, retry, err := c.callResponses(ctx, body)
+		translated, usage, retry, err := c.callResponses(ctx, body)
 		if err == nil {
-			return translated, nil
+			return translated, usage, nil
 		}
 
 		lastErr = err
@@ -108,33 +150,33 @@ func (c *Client) TranslateMarkdownChunk(ctx context.Context, model string, mdChu
 		select {
 		case <-time.After(delay):
 		case <-ctx.Done():
-			return "", ctx.Err()
+			return "", Usage{}, ctx.Err()
 		}
 	}
 
 	if lastErr == nil {
 		lastErr = errors.New("unknown translation error")
 	}
-	return "", lastErr
+	return "", Usage{}, lastErr
 }
 
-func (c *Client) callResponses(ctx context.Context, body []byte) (translated string, retry bool, err error) {
+func (c *Client) callResponses(ctx context.Context, body []byte) (translated string, usage Usage, retry bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return "", false, fmt.Errorf("build OpenAI request: %w", err)
+		return "", Usage{}, false, fmt.Errorf("build OpenAI request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return "", true, fmt.Errorf("request OpenAI Responses API: %w", err)
+		return "", Usage{}, true, fmt.Errorf("request OpenAI Responses API: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", true, fmt.Errorf("read OpenAI response body: %w", err)
+		return "", Usage{}, true, fmt.Errorf("read OpenAI response body: %w", err)
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -145,26 +187,54 @@ func (c *Client) callResponses(ctx context.Context, body []byte) (translated str
 				select {
 				case <-time.After(retryAfter):
 				case <-ctx.Done():
-					return "", false, ctx.Err()
+					return "", Usage{}, false, ctx.Err()
 				}
 			}
-			return "", true, err
+			return "", Usage{}, true, err
 		}
-		return "", false, err
+		return "", Usage{}, false, err
 	}
 
 	output, err := extractOutputText(respBody)
 	if err != nil {
-		return "", false, err
+		return "", Usage{}, false, err
 	}
-	return output, false, nil
+	usage = extractUsage(respBody)
+	return output, usage, false, nil
 }
 
-func buildUserPrompt(mdChunk string, glossaryMap map[string]string) string {
+func buildSystemPrompt(strict bool) string {
+	base := []string{
+		"Translate English Markdown to Simplified Chinese.",
+		"Preserve Markdown layout and syntax exactly.",
+		"Do not translate code fences, inline code, or URLs.",
+		"Keep link targets unchanged.",
+		"Return only translated Markdown with no commentary.",
+	}
+	if strict {
+		base = append(base,
+			"This is a strict retry because the previous translation failed structural validation.",
+			"Do not omit or merge sections, headings, list markers, or code fences.",
+			"The translated markdown must be structurally valid and complete.",
+		)
+	}
+	return strings.Join(base, " ")
+}
+
+func buildUserPrompt(mdChunk string, glossaryMap map[string]string, strict bool, failureReason string) string {
 	var builder strings.Builder
 	builder.WriteString("Translate the following Markdown into Simplified Chinese.\n")
 	builder.WriteString("Keep Markdown syntax, headings, list markers, and links intact.\n")
 	builder.WriteString("Do not translate inline code or fenced code blocks.\n")
+	if strict {
+		builder.WriteString("Strict retry mode: previous translation failed validation.\n")
+		if strings.TrimSpace(failureReason) != "" {
+			builder.WriteString("Failure reason: ")
+			builder.WriteString(strings.TrimSpace(failureReason))
+			builder.WriteString("\n")
+		}
+		builder.WriteString("Fix the issue and return valid markdown only.\n")
+	}
 	if len(glossaryMap) > 0 {
 		builder.WriteString(glossary.Prompt(glossaryMap))
 		builder.WriteString("\n")
@@ -231,6 +301,31 @@ func extractOutputText(body []byte) (string, error) {
 	}
 
 	return strings.TrimSpace(builder.String()), nil
+}
+
+func extractUsage(body []byte) Usage {
+	var parsed struct {
+		Usage struct {
+			InputTokens  int64 `json:"input_tokens"`
+			OutputTokens int64 `json:"output_tokens"`
+			TotalTokens  int64 `json:"total_tokens"`
+		} `json:"usage"`
+	}
+
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return Usage{}
+	}
+
+	if parsed.Usage.InputTokens == 0 && parsed.Usage.OutputTokens == 0 && parsed.Usage.TotalTokens == 0 {
+		return Usage{}
+	}
+
+	return Usage{
+		InputTokens:  parsed.Usage.InputTokens,
+		OutputTokens: parsed.Usage.OutputTokens,
+		TotalTokens:  parsed.Usage.TotalTokens,
+		Available:    true,
+	}
 }
 
 func parseRetryAfter(value string) time.Duration {
