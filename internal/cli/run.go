@@ -27,6 +27,12 @@ const (
 	defaultTranslateWorkers = 4
 	defaultOutDir           = "out"
 	summaryFileName         = "_summary.json"
+
+	errorTypeFetch     = "fetch_failed"
+	errorTypeConvert   = "convert_failed"
+	errorTypeTranslate = "translate_failed"
+	errorTypeOutput    = "output_failed"
+	errorTypeUnknown   = "unknown"
 )
 
 type options struct {
@@ -47,12 +53,13 @@ type outputPlan struct {
 }
 
 type summaryItem struct {
-	SourceURL  string `json:"source_url"`
-	FinalURL   string `json:"final_url,omitempty"`
-	Success    bool   `json:"success"`
-	DurationMS int64  `json:"duration_ms"`
-	OutputPath string `json:"output_path,omitempty"`
-	Error      string `json:"error,omitempty"`
+	SourceURL    string `json:"source_url"`
+	FinalURL     string `json:"final_url,omitempty"`
+	Success      bool   `json:"success"`
+	DurationMS   int64  `json:"duration_ms"`
+	OutputPath   string `json:"output_path,omitempty"`
+	ErrorType    string `json:"error_type,omitempty"`
+	ErrorMessage string `json:"error_message,omitempty"`
 }
 
 type taskSummary struct {
@@ -69,6 +76,19 @@ type taskSummary struct {
 type urlOutput struct {
 	finalURL   string
 	outputPath string
+}
+
+type processError struct {
+	errorType string
+	err       error
+}
+
+func (e *processError) Error() string {
+	return e.err.Error()
+}
+
+func (e *processError) Unwrap() error {
+	return e.err
 }
 
 func Run(args []string, stdout io.Writer, stderr io.Writer) error {
@@ -125,11 +145,13 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		output, err := processURL(runCtx, httpClient, openAIClient, opts, glossaryMap, sourceURL, outPlan, stderr)
 		item.DurationMS = time.Since(itemStart).Milliseconds()
 		if err != nil {
+			errorType, errorMessage := errorDetails(err)
 			item.Success = false
-			item.Error = err.Error()
+			item.ErrorType = errorType
+			item.ErrorMessage = errorMessage
 			summary.FailureCount++
 			summary.Results = append(summary.Results, item)
-			_, _ = fmt.Fprintf(stderr, "Failed: %s (%v)\n", compactURL(sourceURL), err)
+			_, _ = fmt.Fprintf(stderr, "Failed [%s]: %s (%s)\n", errorType, compactURL(sourceURL), errorMessage)
 			continue
 		}
 
@@ -279,9 +301,20 @@ func processURL(
 	outPlan outputPlan,
 	progress io.Writer,
 ) (urlOutput, error) {
-	sourceDoc, err := fetchAndConvert(ctx, httpClient, sourceURL)
+	doc, err := fetch.HTML(ctx, httpClient, sourceURL)
 	if err != nil {
-		return urlOutput{}, err
+		return urlOutput{}, newProcessError(errorTypeFetch, fmt.Errorf("fetch %s: %w", sourceURL, err))
+	}
+
+	markdownText, err := markdown.FromHTML(doc.HTML)
+	if err != nil {
+		return urlOutput{}, newProcessError(errorTypeConvert, fmt.Errorf("convert %s HTML to markdown: %w", sourceURL, err))
+	}
+
+	sourceDoc := sourceDocument{
+		markdown: markdownText,
+		title:    doc.Title,
+		finalURL: doc.FinalURL,
 	}
 
 	taskSourceURL := sourceURL
@@ -291,7 +324,7 @@ func processURL(
 
 	chunks := chunk.SplitMarkdown(sourceDoc.markdown, opts.ChunkSize)
 	if len(chunks) == 0 {
-		return urlOutput{}, fmt.Errorf("no content after markdown conversion")
+		return urlOutput{}, newProcessError(errorTypeConvert, errors.New("no content after markdown conversion"))
 	}
 
 	tasks := make([]translationTask, 0, len(chunks))
@@ -308,7 +341,7 @@ func processURL(
 
 	pairs, err := translateAllChunks(ctx, openAIClient, opts.Model, glossaryMap, tasks, progress)
 	if err != nil {
-		return urlOutput{}, err
+		return urlOutput{}, newProcessError(errorTypeTranslate, err)
 	}
 
 	perURLOpts := opts
@@ -323,10 +356,10 @@ func processURL(
 
 	outPath, err := outputPathForURL(outPlan, taskSourceURL, opts.View)
 	if err != nil {
-		return urlOutput{}, err
+		return urlOutput{}, newProcessError(errorTypeOutput, err)
 	}
 	if err := os.WriteFile(outPath, []byte(output.String()), 0o644); err != nil {
-		return urlOutput{}, fmt.Errorf("write output file %s: %w", outPath, err)
+		return urlOutput{}, newProcessError(errorTypeOutput, fmt.Errorf("write output file %s: %w", outPath, err))
 	}
 
 	return urlOutput{
@@ -408,6 +441,29 @@ func writeSummary(path string, summary taskSummary) error {
 	return nil
 }
 
+func newProcessError(errorType string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &processError{
+		errorType: errorType,
+		err:       err,
+	}
+}
+
+func errorDetails(err error) (errorType string, errorMessage string) {
+	if err == nil {
+		return "", ""
+	}
+
+	var stageErr *processError
+	if errors.As(err, &stageErr) {
+		return stageErr.errorType, stageErr.err.Error()
+	}
+
+	return errorTypeUnknown, err.Error()
+}
+
 func optsStartTime(start time.Time) string {
 	return start.UTC().Format(time.RFC3339)
 }
@@ -416,24 +472,6 @@ type sourceDocument struct {
 	markdown string
 	title    string
 	finalURL string
-}
-
-func fetchAndConvert(ctx context.Context, httpClient *http.Client, sourceURL string) (sourceDocument, error) {
-	doc, err := fetch.HTML(ctx, httpClient, sourceURL)
-	if err != nil {
-		return sourceDocument{}, fmt.Errorf("fetch %s: %w", sourceURL, err)
-	}
-
-	md, err := markdown.FromHTML(doc.HTML)
-	if err != nil {
-		return sourceDocument{}, fmt.Errorf("convert %s HTML to markdown: %w", sourceURL, err)
-	}
-
-	return sourceDocument{
-		markdown: md,
-		title:    doc.Title,
-		finalURL: doc.FinalURL,
-	}, nil
 }
 
 type translationTask struct {
