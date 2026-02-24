@@ -15,6 +15,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	versionpkg "transblog/internal/version"
 )
 
 func TestRunMultiURLWritesPerURLOutputsAndSummary(t *testing.T) {
@@ -561,6 +563,51 @@ func TestParseFlagsRejectsInvalidMaxRetries(t *testing.T) {
 	_, err := parseFlags([]string{"--max-retries", "-1", "https://example.com"}, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "--max-retries must be 0 or greater") {
 		t.Fatalf("parseFlags error=%v, want max-retries validation error", err)
+	}
+}
+
+func TestParseFlagsAllowsVersionWithoutURL(t *testing.T) {
+	opts, err := parseFlags([]string{"--version"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags() error = %v, want nil", err)
+	}
+	if !opts.ShowVersion {
+		t.Fatalf("ShowVersion=false, want true")
+	}
+	if len(opts.SourceURLs) != 0 {
+		t.Fatalf("SourceURLs len=%d, want 0", len(opts.SourceURLs))
+	}
+}
+
+func TestRunVersionSkipsAPIKeyRequirement(t *testing.T) {
+	oldVersion := versionpkg.Version
+	oldCommit := versionpkg.Commit
+	oldBuildTime := versionpkg.BuildTime
+	versionpkg.Version = "v1.2.3"
+	versionpkg.Commit = "abc1234"
+	versionpkg.BuildTime = "2026-02-24T20:30:00Z"
+	t.Cleanup(func() {
+		versionpkg.Version = oldVersion
+		versionpkg.Commit = oldCommit
+		versionpkg.BuildTime = oldBuildTime
+	})
+
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OPENAI_BASE_URL", "")
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := Run([]string{"--version"}, &stdout, &stderr); err != nil {
+		t.Fatalf("Run() error = %v, want nil", err)
+	}
+
+	output := strings.TrimSpace(stdout.String())
+	want := "transblog version=v1.2.3 commit=abc1234 build_time=2026-02-24T20:30:00Z"
+	if output != want {
+		t.Fatalf("stdout = %q, want %q", output, want)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
 	}
 }
 

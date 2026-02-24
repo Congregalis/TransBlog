@@ -23,6 +23,7 @@ import (
 	"transblog/internal/glossary"
 	"transblog/internal/markdown"
 	"transblog/internal/openai"
+	"transblog/internal/version"
 )
 
 const (
@@ -46,6 +47,7 @@ type options struct {
 	Model       string
 	OutPath     string
 	View        bool
+	ShowVersion bool
 	Workers     int
 	MaxRetries  int
 	FailFast    bool
@@ -202,6 +204,10 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return err
 	}
 	if opts.ShowHelp {
+		return nil
+	}
+	if opts.ShowVersion {
+		_, _ = fmt.Fprintln(stdout, version.String())
 		return nil
 	}
 
@@ -385,6 +391,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&opts.Model, "model", "gpt-5.2", "OpenAI model name")
 	fs.StringVar(&opts.OutPath, "out", "", "Output path: file for single URL, directory for multiple URLs (default: ./out/)")
 	fs.BoolVar(&opts.View, "view", false, "Generate HTML split-view with Markdown rendering and synchronized scrolling")
+	fs.BoolVar(&opts.ShowVersion, "version", false, "Print version information and exit")
 	fs.IntVar(&opts.Workers, "workers", defaultTranslateWorkers, "Translation worker count")
 	fs.IntVar(&opts.MaxRetries, "max-retries", defaultMaxRetries, "Maximum retries for OpenAI requests")
 	fs.BoolVar(&opts.FailFast, "fail-fast", false, "Stop at first URL failure (default: continue for partial success)")
@@ -423,6 +430,9 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	}
 
 	opts.SourceURLs = fs.Args()
+	if opts.ShowVersion {
+		return opts, nil
+	}
 	if len(opts.SourceURLs) == 0 {
 		fs.Usage()
 		return options{}, errors.New("at least one URL is required")

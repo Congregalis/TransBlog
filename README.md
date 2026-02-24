@@ -1,139 +1,157 @@
 # TransBlog
 
-`TransBlog` 是一个面向中文开发者的 Go 命令行工具：
+`TransBlog` 是一个把英文技术网页翻译成中文 Markdown/HTML 的 Go CLI。
 
-- 输入英文技术博客 URL
-- 自动抓取页面并转换为 Markdown
-- 按分块翻译为中文，尽量保持原始 Markdown 结构
-- 可选生成中英双栏对照 HTML 阅读页，方便学习
-
-项目目标很直接：把英文技术博客翻译成中文，降低学习门槛。
-
-## 功能特性
-
-- Go 1.24+ CLI（入口：`cmd/transblog`）
-- 支持一次输入一个或多个 URL
-- 使用 `github.com/JohannesKaufmann/html-to-markdown/v2` 将 HTML 转成 Markdown
-- 翻译时尽量保留标题、列表、链接、代码块等 Markdown 结构
-- 自动按块拆分（默认目标：2000 字符）
-- 使用 OpenAI Responses API（`/v1/responses`）并内置 429/5xx 重试与退避
-- 支持术语表（glossary JSON）保证术语一致性
-- 默认输出到当前工作目录 `./out/`，并在终端打印文件路径
-- 支持 `--out` 自定义输出路径
-- 支持 `--view` 生成双栏对照 HTML：
-  - `marked.js` 渲染 Markdown
-  - `DOMPurify` 清理 HTML
-  - `highlight.js` 代码高亮
-  - 双向同步滚动（可开关）
-  - Chunk 快速跳转 + 阅读进度
+- 输入一个或多个 URL
+- 自动抓取正文并转 Markdown
+- 按 chunk 并发翻译，保留结构（标题/列表/链接/代码块）
+- 输出 Markdown 或中英对照 HTML 阅读页
+- 记录每个 URL 的结果汇总、token 用量和成本估算
 
 ## 环境要求
 
-- Go 1.24+
+- Go `1.24+`（源码构建时）
 - `OPENAI_API_KEY` 环境变量
 - 可选：`OPENAI_BASE_URL`（代理或兼容网关）
 
-## 安装与构建
+## 安装
+
+### 方式 1：下载发布包（macOS + Linux）
+
+在 [Releases](https://github.com/Congregalis/TransBlog/releases) 下载对应平台压缩包解压后使用。
+
+### 方式 2：源码构建
 
 ```bash
-go build ./cmd/transblog
+git clone https://github.com/Congregalis/TransBlog.git
+cd TransBlog
+go build -o transblog ./cmd/transblog
 ```
 
-## 使用方式
+## 快速开始（最小可用）
+
+```bash
+export OPENAI_API_KEY="sk-..."
+./transblog https://boristane.com/blog/how-i-use-claude-code/
+```
+
+默认输出到 `./out/`。
+
+## 常用参数
 
 ```bash
 transblog [flags] <url> [url...]
 ```
 
-### 基础示例
-
-```bash
-transblog https://boristane.com/blog/how-i-use-claude-code/
-```
-
-### 生成中英双栏阅读页
-
-```bash
-transblog --view https://boristane.com/blog/how-i-use-claude-code/
-```
-
-### 使用术语表并指定输出
-
-```bash
-transblog \
-  --glossary glossary.json \
-  --model gpt-5.2 \
-  --timeout 120s \
-  --out out.md \
-  https://example.com/post
-```
-
-## 常用参数
-
-- `--model`：模型名称（默认 `gpt-5.2`）
-- `--out`：输出文件路径（默认写入 `./out/`）
-- `--view`：输出 HTML 双栏阅读页（默认输出 Markdown）
-- `--glossary`：术语表 JSON 文件路径
-- `--timeout`：HTTP 超时（示例：`120s`）
+- `--model`：模型名（默认 `gpt-5.2`）
+- `--out`：输出路径（单 URL 可指定文件，多 URL 指定目录）
+- `--view`：输出中英对照 HTML 阅读页
 - `--chunk-size`：目标分块长度（字符数）
+- `--workers`：翻译并发（默认 `4`）
+- `--max-retries`：OpenAI 请求最大重试次数（默认 `5`）
+- `--fail-fast`：首个 URL 失败后立即停止（默认继续跑剩余 URL）
+- `--glossary`：术语表 JSON 文件
+- `--price-config`：价格配置 JSON（用于成本估算）
+- `--timeout`：HTTP 超时（例：`120s`）
+- `--version`：打印 `version/commit/build_time`
 
-## 术语表格式
+## 批量示例
 
-准备一个 JSON 文件，键值均为字符串：
+### 命令行直接传多个 URL
+
+```bash
+./transblog \
+  https://example.com/post-a \
+  https://example.com/post-b \
+  https://example.com/post-c
+```
+
+### 从文件批量（借助 shell）
+
+`urls.txt`:
+
+```text
+https://example.com/post-a
+https://example.com/post-b
+https://example.com/post-c
+```
+
+执行：
+
+```bash
+xargs ./transblog < urls.txt
+```
+
+## 成本与用量说明
+
+若配置 `--price-config`，会在终端和 `out/_summary.json` 输出 token 与预估成本。
+
+`price.json` 示例：
 
 ```json
 {
-  "agent": "智能体",
-  "chunk": "分块",
-  "prompt": "提示词"
+  "gpt-5.2": {
+    "input_per_million": 1.0,
+    "output_per_million": 2.0
+  },
+  "default": {
+    "total_per_million": 3.0
+  }
 }
 ```
 
-## 输出说明
-
-默认不传 `--out` 时，会写入当前目录下的 `out/`，并打印类似：
-
-```text
-Output: out/<generated-name>.md
-```
-
-当启用 `--view` 时，输出扩展名为 `.html`。
-
-Markdown 输出会包含 YAML front-matter，例如：
-
-```yaml
----
-source_urls:
-  - https://example.com/post
-generated_at: 2026-02-22T10:00:00Z
-model: gpt-5.2
----
-```
-
-随后每个分块按以下结构写入：
-
-```markdown
-<英文原文分块>
-
----
-
-<中文翻译分块>
-```
-
-## 测试
+运行：
 
 ```bash
-go test ./...
+./transblog --price-config price.json https://example.com/post
 ```
 
-## 贡献
+## 输出与恢复机制
 
-欢迎提 Issue 或 PR，提交前请先阅读：`CONTRIBUTING.md`
+- 多 URL 会生成每 URL 一个输出文件 + `out/_summary.json`
+- `.transblog.state.json` 自动记录未完成进度（按 URL + chunk）
+- 再次执行同 URL 会自动复用已完成 chunk（自动 resume）
+- URL 翻译全部完成后会自动删除对应 state 条目；全部完成时状态文件会被删除
 
-## 安全
+## 常见错误
 
-安全问题请参考：`SECURITY.md`
+- `OPENAI_API_KEY is required`：未设置 API Key
+- `status 429`：触发频率限制，建议降低 `--workers` 或稍后重试
+- `fetch_failed`：URL 无法访问/超时/返回异常状态码
+- `translate_failed`：模型响应异常或质量校验未通过
+- `output_failed`：写文件或状态文件失败
 
-## 许可证
+详细排查见：`docs/troubleshooting.md`
 
-MIT，见：`LICENSE`
+## 版本信息
+
+```bash
+./transblog --version
+```
+
+示例输出：
+
+```text
+transblog version=v1.0.0 commit=abc1234 build_time=2026-02-24T20:30:00Z
+```
+
+## 开发与测试
+
+```bash
+gofmt -w .
+go vet ./...
+go test ./...
+go build ./cmd/transblog
+```
+
+## 发布
+
+- 本地发布流程清单：`docs/release-checklist.md`
+- Tag `v*` 会触发 GitHub Actions + GoReleaser 产出 macOS/Linux 资产
+
+## 贡献与安全
+
+- 贡献指南：`CONTRIBUTING.md`
+- 安全策略：`SECURITY.md`
+- 许可证：`LICENSE`
+

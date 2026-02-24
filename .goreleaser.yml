@@ -1,0 +1,35 @@
+version: 2
+
+project_name: transblog
+
+builds:
+  - id: transblog
+    main: ./cmd/transblog
+    binary: transblog
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X transblog/internal/version.Version={{.Version}}
+      - -X transblog/internal/version.Commit={{.Commit}}
+      - -X transblog/internal/version.BuildTime={{.Date}}
+
+archives:
+  - id: default
+    builds:
+      - transblog
+    format: tar.gz
+    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+
+checksum:
+  name_template: checksums.txt
+
+changelog:
+  use: git
+
