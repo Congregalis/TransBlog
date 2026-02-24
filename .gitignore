@@ -1,5 +1,6 @@
 .env
 /transblog
+/NEXTSTEP.md
 
 # build and generated output
 out/

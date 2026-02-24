@@ -25,6 +25,8 @@ import (
 const (
 	defaultChunkSize        = 2000
 	defaultTranslateWorkers = 4
+	defaultOutDir           = "out"
+	summaryFileName         = "_summary.json"
 )
 
 type options struct {
@@ -38,6 +40,37 @@ type options struct {
 	SourceURLs []string
 }
 
+type outputPlan struct {
+	outputDir  string
+	singleFile string
+	summaryDir string
+}
+
+type summaryItem struct {
+	SourceURL  string `json:"source_url"`
+	FinalURL   string `json:"final_url,omitempty"`
+	Success    bool   `json:"success"`
+	DurationMS int64  `json:"duration_ms"`
+	OutputPath string `json:"output_path,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+type taskSummary struct {
+	GeneratedAt     string        `json:"generated_at"`
+	Model           string        `json:"model"`
+	View            bool          `json:"view"`
+	TotalURLs       int           `json:"total_urls"`
+	SuccessCount    int           `json:"success_count"`
+	FailureCount    int           `json:"failure_count"`
+	TotalDurationMS int64         `json:"total_duration_ms"`
+	Results         []summaryItem `json:"results"`
+}
+
+type urlOutput struct {
+	finalURL   string
+	outputPath string
+}
+
 func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 	opts, err := parseFlags(args, stderr)
 	if err != nil {
@@ -45,6 +78,11 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 	}
 	if opts.ShowHelp {
 		return nil
+	}
+
+	opts.SourceURLs = normalizeSourceURLs(opts.SourceURLs)
+	if len(opts.SourceURLs) == 0 {
+		return errors.New("at least one URL is required")
 	}
 
 	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
@@ -60,87 +98,71 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return err
 	}
 
-	openAIClient := openai.NewClient(apiKey, baseURL, httpClient)
-
-	var tasks []translationTask
-
-	ctx := context.Background()
-	for _, rawURL := range opts.SourceURLs {
-		sourceURL := strings.TrimSpace(rawURL)
-		if sourceURL == "" {
-			continue
-		}
-
-		markdownDoc, err := fetchAndConvert(ctx, httpClient, sourceURL)
-		if err != nil {
-			return err
-		}
-
-		chunks := chunk.SplitMarkdown(markdownDoc, opts.ChunkSize)
-		if len(chunks) == 0 {
-			continue
-		}
-
-		for idx, mdChunk := range chunks {
-			tasks = append(tasks, translationTask{
-				outputIndex: len(tasks),
-				sourceURL:   sourceURL,
-				sourceChunk: mdChunk,
-				chunkNumber: idx + 1,
-				chunkTotal:  len(chunks),
-			})
-		}
-	}
-
-	pairs, err := translateAllChunks(ctx, openAIClient, opts.Model, glossaryMap, tasks, stderr)
+	outPlan, err := buildOutputPlan(opts)
 	if err != nil {
 		return err
 	}
-
-	var output strings.Builder
-	if opts.View {
-		writeHTMLView(&output, pairs, opts)
-	} else {
-		writeMarkdown(&output, pairs, opts)
-	}
-
-	result := output.String()
-	if opts.OutPath == "" {
-		// Default: save to ./out/ directory
-		outDir := "out"
-		if err := os.MkdirAll(outDir, 0o755); err != nil {
-			return fmt.Errorf("create output directory: %w", err)
-		}
-
-		// Generate filename from first URL
-		u := opts.SourceURLs[0]
-		parsed, err := url.Parse(u)
-		if err != nil || parsed.Host == "" {
-			return fmt.Errorf("invalid URL: %s", u)
-		}
-		filename := strings.ReplaceAll(parsed.Host+parsed.Path, "/", "_")
-		ext := ".md"
-		if opts.View {
-			ext = ".html"
-		}
-		filename = strings.TrimSuffix(filename, "_") + ext
-		if filename == ext {
-			filename = "output" + ext
-		}
-
-		outPath := filepath.Join(outDir, filename)
-		if err := os.WriteFile(outPath, []byte(result), 0o644); err != nil {
-			return fmt.Errorf("write output file %s: %w", outPath, err)
-		}
-		_, err = fmt.Fprintf(stdout, "Output: %s\n", outPath)
+	if err := prepareOutputPlan(outPlan); err != nil {
 		return err
 	}
 
-	if err := os.MkdirAll(filepath.Dir(opts.OutPath), 0o755); err != nil && filepath.Dir(opts.OutPath) != "." {
-		return fmt.Errorf("create output directory: %w", err)
+	openAIClient := openai.NewClient(apiKey, baseURL, httpClient)
+	runCtx := context.Background()
+	runStart := time.Now()
+
+	summary := taskSummary{
+		GeneratedAt: optsStartTime(runStart),
+		Model:       opts.Model,
+		View:        opts.View,
+		TotalURLs:   len(opts.SourceURLs),
+		Results:     make([]summaryItem, 0, len(opts.SourceURLs)),
 	}
-	if err := os.WriteFile(opts.OutPath, []byte(result), 0o644); err != nil {
-		return fmt.Errorf("write output file %s: %w", opts.OutPath, err)
+
+	for _, sourceURL := range opts.SourceURLs {
+		itemStart := time.Now()
+		item := summaryItem{SourceURL: sourceURL}
+
+		output, err := processURL(runCtx, httpClient, openAIClient, opts, glossaryMap, sourceURL, outPlan, stderr)
+		item.DurationMS = time.Since(itemStart).Milliseconds()
+		if err != nil {
+			item.Success = false
+			item.Error = err.Error()
+			summary.FailureCount++
+			summary.Results = append(summary.Results, item)
+			_, _ = fmt.Fprintf(stderr, "Failed: %s (%v)\n", compactURL(sourceURL), err)
+			continue
+		}
+
+		item.Success = true
+		item.FinalURL = output.finalURL
+		item.OutputPath = output.outputPath
+		summary.SuccessCount++
+		summary.Results = append(summary.Results, item)
+
+		_, _ = fmt.Fprintf(stdout, "Output: %s\n", output.outputPath)
+	}
+
+	summary.TotalDurationMS = time.Since(runStart).Milliseconds()
+
+	var summaryPath string
+	if len(opts.SourceURLs) > 1 {
+		summaryPath = filepath.Join(outPlan.summaryDir, summaryFileName)
+		if err := writeSummary(summaryPath, summary); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(stdout, "Summary: %s\n", summaryPath)
+	}
+
+	_, _ = fmt.Fprintf(
+		stdout,
+		"Done: %d succeeded, %d failed, total %s\n",
+		summary.SuccessCount,
+		summary.FailureCount,
+		time.Duration(summary.TotalDurationMS)*time.Millisecond,
+	)
+
+	if summary.FailureCount > 0 {
+		return fmt.Errorf("%d URL(s) failed", summary.FailureCount)
 	}
 	return nil
 }
@@ -151,7 +173,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 
 	opts := options{}
 	fs.StringVar(&opts.Model, "model", "gpt-5.2", "OpenAI model name")
-	fs.StringVar(&opts.OutPath, "out", "", "Output markdown file (default: ./out/)")
+	fs.StringVar(&opts.OutPath, "out", "", "Output path: file for single URL, directory for multiple URLs (default: ./out/)")
 	fs.BoolVar(&opts.View, "view", false, "Generate HTML split-view with Markdown rendering and synchronized scrolling")
 	fs.StringVar(&opts.Glossary, "glossary", "", "Path to glossary JSON map, e.g. {\"term\":\"translation\"}")
 	fs.DurationVar(&opts.Timeout, "timeout", 90*time.Second, "HTTP timeout, e.g. 120s")
@@ -189,23 +211,235 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	return opts, nil
 }
 
-func fetchAndConvert(ctx context.Context, httpClient *http.Client, sourceURL string) (string, error) {
-	html, err := fetch.HTML(ctx, httpClient, sourceURL)
-	if err != nil {
-		return "", fmt.Errorf("fetch %s: %w", sourceURL, err)
+func normalizeSourceURLs(urls []string) []string {
+	out := make([]string, 0, len(urls))
+	for _, raw := range urls {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		out = append(out, trimmed)
+	}
+	return out
+}
+
+func buildOutputPlan(opts options) (outputPlan, error) {
+	if opts.OutPath == "" {
+		return outputPlan{
+			outputDir:  defaultOutDir,
+			summaryDir: defaultOutDir,
+		}, nil
 	}
 
-	md, err := markdown.FromHTML(html)
-	if err != nil {
-		return "", fmt.Errorf("convert %s HTML to markdown: %w", sourceURL, err)
+	if len(opts.SourceURLs) == 1 {
+		return outputPlan{
+			singleFile: opts.OutPath,
+			summaryDir: filepath.Dir(opts.OutPath),
+		}, nil
 	}
 
-	return md, nil
+	return outputPlan{
+		outputDir:  opts.OutPath,
+		summaryDir: opts.OutPath,
+	}, nil
+}
+
+func prepareOutputPlan(plan outputPlan) error {
+	if plan.outputDir != "" {
+		if err := os.MkdirAll(plan.outputDir, 0o755); err != nil {
+			return fmt.Errorf("create output directory: %w", err)
+		}
+	}
+
+	if plan.singleFile != "" {
+		dir := filepath.Dir(plan.singleFile)
+		if dir != "." {
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				return fmt.Errorf("create output directory: %w", err)
+			}
+		}
+	}
+
+	if plan.summaryDir != "" && plan.summaryDir != "." {
+		if err := os.MkdirAll(plan.summaryDir, 0o755); err != nil {
+			return fmt.Errorf("create summary directory: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func processURL(
+	ctx context.Context,
+	httpClient *http.Client,
+	openAIClient *openai.Client,
+	opts options,
+	glossaryMap map[string]string,
+	sourceURL string,
+	outPlan outputPlan,
+	progress io.Writer,
+) (urlOutput, error) {
+	sourceDoc, err := fetchAndConvert(ctx, httpClient, sourceURL)
+	if err != nil {
+		return urlOutput{}, err
+	}
+
+	taskSourceURL := sourceURL
+	if sourceDoc.finalURL != "" {
+		taskSourceURL = sourceDoc.finalURL
+	}
+
+	chunks := chunk.SplitMarkdown(sourceDoc.markdown, opts.ChunkSize)
+	if len(chunks) == 0 {
+		return urlOutput{}, fmt.Errorf("no content after markdown conversion")
+	}
+
+	tasks := make([]translationTask, 0, len(chunks))
+	for idx, mdChunk := range chunks {
+		tasks = append(tasks, translationTask{
+			outputIndex: len(tasks),
+			sourceURL:   taskSourceURL,
+			sourceTitle: sourceDoc.title,
+			sourceChunk: mdChunk,
+			chunkNumber: idx + 1,
+			chunkTotal:  len(chunks),
+		})
+	}
+
+	pairs, err := translateAllChunks(ctx, openAIClient, opts.Model, glossaryMap, tasks, progress)
+	if err != nil {
+		return urlOutput{}, err
+	}
+
+	perURLOpts := opts
+	perURLOpts.SourceURLs = []string{taskSourceURL}
+
+	var output strings.Builder
+	if opts.View {
+		writeHTMLView(&output, pairs, perURLOpts)
+	} else {
+		writeMarkdown(&output, pairs, perURLOpts)
+	}
+
+	outPath, err := outputPathForURL(outPlan, taskSourceURL, opts.View)
+	if err != nil {
+		return urlOutput{}, err
+	}
+	if err := os.WriteFile(outPath, []byte(output.String()), 0o644); err != nil {
+		return urlOutput{}, fmt.Errorf("write output file %s: %w", outPath, err)
+	}
+
+	return urlOutput{
+		finalURL:   taskSourceURL,
+		outputPath: outPath,
+	}, nil
+}
+
+func outputPathForURL(plan outputPlan, sourceURL string, view bool) (string, error) {
+	if plan.singleFile != "" {
+		return plan.singleFile, nil
+	}
+
+	filename, err := filenameFromURL(sourceURL, view)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(plan.outputDir, filename), nil
+}
+
+func filenameFromURL(rawURL string, view bool) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil || parsed.Host == "" {
+		return "", fmt.Errorf("invalid URL: %s", rawURL)
+	}
+
+	base := parsed.Host + parsed.Path
+	if parsed.RawQuery != "" {
+		base += "_" + parsed.RawQuery
+	}
+	base = strings.ReplaceAll(base, "/", "_")
+	base = sanitizeFilename(base)
+	base = strings.Trim(base, "_")
+	if base == "" {
+		base = "output"
+	}
+
+	ext := ".md"
+	if view {
+		ext = ".html"
+	}
+	return base + ext, nil
+}
+
+func sanitizeFilename(s string) string {
+	var b strings.Builder
+	lastUnderscore := false
+
+	for _, r := range s {
+		allowed := (r >= 'a' && r <= 'z') ||
+			(r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') ||
+			r == '.' || r == '-' || r == '_'
+
+		if allowed {
+			b.WriteRune(r)
+			lastUnderscore = r == '_'
+			continue
+		}
+
+		if !lastUnderscore {
+			b.WriteByte('_')
+			lastUnderscore = true
+		}
+	}
+
+	return b.String()
+}
+
+func writeSummary(path string, summary taskSummary) error {
+	payload, err := json.MarshalIndent(summary, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal summary JSON: %w", err)
+	}
+	payload = append(payload, '\n')
+	if err := os.WriteFile(path, payload, 0o644); err != nil {
+		return fmt.Errorf("write summary file %s: %w", path, err)
+	}
+	return nil
+}
+
+func optsStartTime(start time.Time) string {
+	return start.UTC().Format(time.RFC3339)
+}
+
+type sourceDocument struct {
+	markdown string
+	title    string
+	finalURL string
+}
+
+func fetchAndConvert(ctx context.Context, httpClient *http.Client, sourceURL string) (sourceDocument, error) {
+	doc, err := fetch.HTML(ctx, httpClient, sourceURL)
+	if err != nil {
+		return sourceDocument{}, fmt.Errorf("fetch %s: %w", sourceURL, err)
+	}
+
+	md, err := markdown.FromHTML(doc.HTML)
+	if err != nil {
+		return sourceDocument{}, fmt.Errorf("convert %s HTML to markdown: %w", sourceURL, err)
+	}
+
+	return sourceDocument{
+		markdown: md,
+		title:    doc.Title,
+		finalURL: doc.FinalURL,
+	}, nil
 }
 
 type translationTask struct {
 	outputIndex int
 	sourceURL   string
+	sourceTitle string
 	sourceChunk string
 	chunkNumber int
 	chunkTotal  int
@@ -308,9 +542,10 @@ func translateAllChunks(
 
 		task := result.task
 		pairs[task.outputIndex] = pair{
-			sourceURL:  task.sourceURL,
-			source:     task.sourceChunk,
-			translated: result.translated,
+			sourceURL:   task.sourceURL,
+			sourceTitle: task.sourceTitle,
+			source:      task.sourceChunk,
+			translated:  result.translated,
 		}
 
 		completed++
@@ -370,9 +605,10 @@ func writeFrontMatter(w io.StringWriter, opts options) {
 }
 
 type pair struct {
-	sourceURL  string
-	source     string
-	translated string
+	sourceURL   string
+	sourceTitle string
+	source      string
+	translated  string
 }
 
 func writeMarkdown(w io.StringWriter, pairs []pair, opts options) {
@@ -382,9 +618,17 @@ func writeMarkdown(w io.StringWriter, pairs []pair, opts options) {
 		if i > 0 {
 			_, _ = w.WriteString("\n\n")
 		}
-		_, _ = w.WriteString("## Source: ")
-		_, _ = w.WriteString(p.sourceURL)
-		_, _ = w.WriteString("\n\n")
+		if p.sourceTitle != "" {
+			_, _ = w.WriteString("## Source: ")
+			_, _ = w.WriteString(p.sourceTitle)
+			_, _ = w.WriteString(" (")
+			_, _ = w.WriteString(p.sourceURL)
+			_, _ = w.WriteString(")\n\n")
+		} else {
+			_, _ = w.WriteString("## Source: ")
+			_, _ = w.WriteString(p.sourceURL)
+			_, _ = w.WriteString("\n\n")
+		}
 		_, _ = w.WriteString(p.source)
 		_, _ = w.WriteString("\n\n---\n\n")
 		_, _ = w.WriteString(p.translated)
@@ -393,17 +637,19 @@ func writeMarkdown(w io.StringWriter, pairs []pair, opts options) {
 
 func writeHTMLView(w io.StringWriter, pairs []pair, opts options) {
 	type viewPair struct {
-		SourceURL  string `json:"sourceURL"`
-		Source     string `json:"source"`
-		Translated string `json:"translated"`
+		SourceURL   string `json:"sourceURL"`
+		SourceTitle string `json:"sourceTitle,omitempty"`
+		Source      string `json:"source"`
+		Translated  string `json:"translated"`
 	}
 
 	viewPairs := make([]viewPair, 0, len(pairs))
 	for _, p := range pairs {
 		viewPairs = append(viewPairs, viewPair{
-			SourceURL:  p.sourceURL,
-			Source:     p.source,
-			Translated: p.translated,
+			SourceURL:   p.sourceURL,
+			SourceTitle: p.sourceTitle,
+			Source:      p.source,
+			Translated:  p.translated,
 		})
 	}
 
@@ -1111,12 +1357,13 @@ body.theme-dark .markdown-body td {
     const tops = chunks.map(function (chunk) {
       return chunk.offsetTop;
     });
+    const maxTop = Math.max(pane.scrollHeight - pane.clientHeight, 0);
     const spans = chunks.map(function (_, index) {
       const start = tops[index];
-      const end = index + 1 < tops.length ? tops[index + 1] : pane.scrollHeight;
+      const end = index + 1 < tops.length ? tops[index + 1] : maxTop;
       return Math.max(end - start, 1);
     });
-    return { tops: tops, spans: spans };
+    return { tops: tops, spans: spans, maxTop: maxTop };
   }
 
   function refreshMetrics() {
@@ -1154,6 +1401,20 @@ body.theme-dark .markdown-body td {
     if (!metric || metric.tops.length === 0) {
       return { index: 0, progress: 0 };
     }
+    const maxTop = metric.maxTop || Math.max(pane.scrollHeight - pane.clientHeight, 0);
+    if (pane.scrollTop >= maxTop - 1) {
+      return { index: metric.tops.length - 1, progress: 1 };
+    }
+
+    const firstTop = metric.tops[0] || 0;
+    if (pane.scrollTop <= firstTop) {
+      const leadRatio = firstTop > 0 ? pane.scrollTop / firstTop : 0;
+      return {
+        index: 0,
+        progress: 0,
+        leadRatio: Math.max(0, Math.min(leadRatio, 1)),
+      };
+    }
 
     const index = findChunkIndex(metric.tops, pane.scrollTop);
     const start = metric.tops[index];
@@ -1168,12 +1429,18 @@ body.theme-dark .markdown-body td {
     if (!metric || metric.tops.length === 0) {
       return 0;
     }
+    const maxTop = metric.maxTop || Math.max(pane.scrollHeight - pane.clientHeight, 0);
+
+    if (typeof state.leadRatio === "number") {
+      const firstTop = metric.tops[0] || 0;
+      const leadTop = firstTop * Math.max(0, Math.min(state.leadRatio, 1));
+      return Math.max(0, Math.min(leadTop, maxTop));
+    }
 
     const safeIndex = Math.max(0, Math.min(state.index, metric.tops.length - 1));
     const start = metric.tops[safeIndex];
     const span = metric.spans[safeIndex] || 1;
     const top = start + span * state.progress;
-    const maxTop = Math.max(pane.scrollHeight - pane.clientHeight, 0);
     return Math.max(0, Math.min(top, maxTop));
   }
 
@@ -1211,6 +1478,21 @@ body.theme-dark .markdown-body td {
 
     if (!syncLock.checked) {
       return;
+    }
+
+    const sourceMetric = metrics[sourcePaneId];
+    const targetMetric = metrics[targetPaneId];
+    if (sourceMetric && targetMetric) {
+      const sourceMaxTop = sourceMetric.maxTop || Math.max(sourcePane.scrollHeight - sourcePane.clientHeight, 0);
+      const targetMaxTop = targetMetric.maxTop || Math.max(targetPane.scrollHeight - targetPane.clientHeight, 0);
+
+      if (sourcePane.scrollTop >= sourceMaxTop - 1) {
+        if (Math.abs(targetPane.scrollTop - targetMaxTop) > 0.5) {
+          markSuppressed(targetPaneId, 72);
+          targetPane.scrollTop = targetMaxTop;
+        }
+        return;
+      }
     }
 
     const targetTop = stateToTop(targetPaneId, state);
