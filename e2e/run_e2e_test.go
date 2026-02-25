@@ -50,15 +50,12 @@ func TestE2ESingleURLSuccess(t *testing.T) {
 			t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
 		}
 
-		matches, err := filepath.Glob(filepath.Join(tmpDir, "out", "*.md"))
-		if err != nil {
-			t.Fatalf("glob output file: %v", err)
-		}
-		if len(matches) != 1 {
-			t.Fatalf("output files len=%d, want 1", len(matches))
+		paths := outputPathsFromStdout(stdout.String())
+		if len(paths) == 0 {
+			t.Fatalf("stdout missing output path: %s", stdout.String())
 		}
 
-		content, err := os.ReadFile(matches[0])
+		content, err := os.ReadFile(paths[0])
 		if err != nil {
 			t.Fatalf("read output: %v", err)
 		}
@@ -111,7 +108,7 @@ func TestE2EMultiURLPartialFailure(t *testing.T) {
 			t.Fatalf("Run() error = nil, want partial-failure error")
 		}
 
-		summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
+		summaryPath := summaryPathFromStdout(t, stdout.String())
 		summaryData, readErr := os.ReadFile(summaryPath)
 		if readErr != nil {
 			t.Fatalf("read summary: %v", readErr)
@@ -294,4 +291,40 @@ func sampleLongArticle(title string) string {
 	}
 	b.WriteString("</article></body></html>")
 	return b.String()
+}
+
+func summaryPathFromStdout(t *testing.T, stdout string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(stdout, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Summary: ") {
+			path := strings.TrimSpace(strings.TrimPrefix(trimmed, "Summary: "))
+			if path != "" {
+				return path
+			}
+		}
+	}
+	t.Fatalf("stdout missing summary path: %s", stdout)
+	return ""
+}
+
+func outputPathsFromStdout(stdout string) []string {
+	paths := make([]string, 0, 2)
+	for _, line := range strings.Split(stdout, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if idx := strings.Index(trimmed, "Output: "); idx >= 0 {
+			path := strings.TrimSpace(trimmed[idx+len("Output: "):])
+			if path != "" {
+				paths = append(paths, path)
+			}
+		}
+		if idx := strings.Index(trimmed, "Output (HTML): "); idx >= 0 {
+			path := strings.TrimSpace(trimmed[idx+len("Output (HTML): "):])
+			if path != "" {
+				paths = append(paths, path)
+			}
+		}
+	}
+	return paths
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,7 +18,10 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
 
+	"github.com/joho/godotenv"
+	"golang.org/x/term"
 	"transblog/internal/chunk"
 	"transblog/internal/fetch"
 	"transblog/internal/glossary"
@@ -33,6 +37,7 @@ const (
 	defaultOutDir           = "out"
 	summaryFileName         = "_summary.json"
 	stateFileName           = ".transblog.state.json"
+	defaultEnvFileName      = ".env"
 
 	errorTypeFetch     = "fetch_failed"
 	errorTypeConvert   = "convert_failed"
@@ -43,26 +48,42 @@ const (
 	defaultQualityRetries = 1
 )
 
+var cliInput io.Reader = os.Stdin
+var nowFunc = time.Now
+
 type options struct {
-	Model       string
-	OutPath     string
-	View        bool
-	ShowVersion bool
-	Workers     int
-	MaxRetries  int
-	FailFast    bool
-	PriceConfig string
-	Glossary    string
-	Timeout     time.Duration
-	ChunkSize   int
-	ShowHelp    bool
-	SourceURLs  []string
+	Model        string
+	OutPath      string
+	DefaultOut   string
+	View         bool
+	GenerateBoth bool
+	ShowVersion  bool
+	ConfigPath   string
+	Workers      int
+	MaxRetries   int
+	FailFast     bool
+	PriceConfig  string
+	Glossary     string
+	Timeout      time.Duration
+	ChunkSize    int
+	ShowHelp     bool
+	SourceURLs   []string
+	setFlags     map[string]bool
 }
 
 type outputPlan struct {
+	outputRoot string
 	outputDir  string
 	singleFile string
 	summaryDir string
+	stateDir   string
+	batchID    string
+	batchDate  string
+	namer      *outputNamer
+}
+
+type outputNamer struct {
+	usedBases map[string]struct{}
 }
 
 type summaryItem struct {
@@ -71,6 +92,7 @@ type summaryItem struct {
 	Success              bool    `json:"success"`
 	DurationMS           int64   `json:"duration_ms"`
 	OutputPath           string  `json:"output_path,omitempty"`
+	HTMLOutputPath       string  `json:"html_output_path,omitempty"`
 	QualityFallbackCount int     `json:"quality_fallback_count,omitempty"`
 	InputTokens          int64   `json:"input_tokens,omitempty"`
 	OutputTokens         int64   `json:"output_tokens,omitempty"`
@@ -85,6 +107,10 @@ type summaryItem struct {
 
 type taskSummary struct {
 	GeneratedAt               string        `json:"generated_at"`
+	BatchID                   string        `json:"batch_id,omitempty"`
+	BatchDate                 string        `json:"batch_date,omitempty"`
+	Labels                    []string      `json:"labels,omitempty"`
+	RetryableFailedURLs       []string      `json:"retry_failed_urls,omitempty"`
 	Model                     string        `json:"model"`
 	View                      bool          `json:"view"`
 	TotalURLs                 int           `json:"total_urls"`
@@ -105,6 +131,7 @@ type taskSummary struct {
 type urlOutput struct {
 	finalURL             string
 	outputPath           string
+	htmlOutputPath       string
 	qualityFallbackCount int
 	usage                usageStats
 	costEstimate         float64
@@ -141,6 +168,13 @@ func (u *usageStats) addOpenAIUsage(usage openai.Usage) {
 		return
 	}
 	u.missingUsageCount++
+}
+
+func (o options) flagSet(name string) bool {
+	if o.setFlags == nil {
+		return false
+	}
+	return o.setFlags[name]
 }
 
 type resumeState struct {
@@ -211,14 +245,26 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return nil
 	}
 
-	opts.SourceURLs = normalizeSourceURLs(opts.SourceURLs)
-	if len(opts.SourceURLs) == 0 {
-		return errors.New("at least one URL is required")
+	envPath := resolveEnvPath(opts.ConfigPath)
+	envValues, err := loadLocalEnv(envPath)
+	if err != nil {
+		return err
 	}
+	applyEnvDefaults(&opts, envValues)
 
 	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+	opts.SourceURLs = normalizeSourceURLs(opts.SourceURLs)
+	if apiKey == "" || len(opts.SourceURLs) == 0 {
+		opts, apiKey, err = runOnboarding(opts, envPath, envValues, apiKey, stdout, stderr)
+		if err != nil {
+			return err
+		}
+	}
 	if apiKey == "" {
-		return errors.New("OPENAI_API_KEY is required")
+		return errors.New(buildMissingAPIKeyGuidance(envPath, opts))
+	}
+	if len(opts.SourceURLs) == 0 {
+		return errors.New("at least one URL is required")
 	}
 
 	baseURL := strings.TrimSpace(os.Getenv("OPENAI_BASE_URL"))
@@ -243,6 +289,9 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 	}
 
 	statePath := filepath.Join(outPlan.summaryDir, stateFileName)
+	if strings.TrimSpace(outPlan.stateDir) != "" {
+		statePath = filepath.Join(outPlan.stateDir, stateFileName)
+	}
 	stateStore, err := loadResumeStore(statePath)
 	if err != nil {
 		return err
@@ -255,6 +304,9 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 
 	summary := taskSummary{
 		GeneratedAt: optsStartTime(runStart),
+		BatchID:     outPlan.batchID,
+		BatchDate:   outPlan.batchDate,
+		Labels:      buildSummaryLabels(opts),
 		Model:       opts.Model,
 		View:        opts.View,
 		TotalURLs:   len(opts.SourceURLs),
@@ -296,6 +348,7 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 				}
 			}
 			summary.Results = append(summary.Results, item)
+			summary.RetryableFailedURLs = append(summary.RetryableFailedURLs, sourceURL)
 			_, _ = fmt.Fprintf(stderr, "Failed [%s]: %s (%s)\n", errorType, compactURL(sourceURL), errorMessage)
 			if opts.FailFast {
 				_, _ = fmt.Fprintln(stderr, "Fail-fast enabled: stop after first failure.")
@@ -307,6 +360,7 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		item.Success = true
 		item.FinalURL = output.finalURL
 		item.OutputPath = output.outputPath
+		item.HTMLOutputPath = output.htmlOutputPath
 		item.QualityFallbackCount = output.qualityFallbackCount
 		item.InputTokens = output.usage.inputTokens
 		item.OutputTokens = output.usage.outputTokens
@@ -333,9 +387,13 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		summary.Results = append(summary.Results, item)
 
 		_, _ = fmt.Fprintf(stdout, "Output: %s\n", output.outputPath)
+		if output.htmlOutputPath != "" {
+			_, _ = fmt.Fprintf(stdout, "Output (HTML): %s\n", output.htmlOutputPath)
+		}
 	}
 
 	summary.TotalDurationMS = time.Since(runStart).Milliseconds()
+	summary.RetryableFailedURLs = uniqueStrings(summary.RetryableFailedURLs)
 
 	var summaryPath string
 	if len(opts.SourceURLs) > 1 {
@@ -392,6 +450,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&opts.OutPath, "out", "", "Output path: file for single URL, directory for multiple URLs (default: ./out/)")
 	fs.BoolVar(&opts.View, "view", false, "Generate HTML split-view with Markdown rendering and synchronized scrolling")
 	fs.BoolVar(&opts.ShowVersion, "version", false, "Print version information and exit")
+	fs.StringVar(&opts.ConfigPath, "config", "", "Env file path (default: ./.env)")
 	fs.IntVar(&opts.Workers, "workers", defaultTranslateWorkers, "Translation worker count")
 	fs.IntVar(&opts.MaxRetries, "max-retries", defaultMaxRetries, "Maximum retries for OpenAI requests")
 	fs.BoolVar(&opts.FailFast, "fail-fast", false, "Stop at first URL failure (default: continue for partial success)")
@@ -416,6 +475,11 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		}
 		return options{}, err
 	}
+	opts.setFlags = map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		opts.setFlags[f.Name] = true
+	})
+
 	if opts.Timeout <= 0 {
 		return options{}, errors.New("--timeout must be positive")
 	}
@@ -432,10 +496,6 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	opts.SourceURLs = fs.Args()
 	if opts.ShowVersion {
 		return opts, nil
-	}
-	if len(opts.SourceURLs) == 0 {
-		fs.Usage()
-		return options{}, errors.New("at least one URL is required")
 	}
 
 	return opts, nil
@@ -455,23 +515,142 @@ func normalizeSourceURLs(urls []string) []string {
 
 func buildOutputPlan(opts options) (outputPlan, error) {
 	if opts.OutPath == "" {
-		return outputPlan{
-			outputDir:  defaultOutDir,
-			summaryDir: defaultOutDir,
-		}, nil
+		outDir := defaultOutDir
+		if configured := strings.TrimSpace(opts.DefaultOut); configured != "" {
+			outDir = configured
+		}
+		return buildBatchOutputPlan(outDir, opts.SourceURLs), nil
 	}
 
 	if len(opts.SourceURLs) == 1 {
+		stateDir := filepath.Dir(opts.OutPath)
+		if stateDir == "." {
+			stateDir = ""
+		}
 		return outputPlan{
 			singleFile: opts.OutPath,
 			summaryDir: filepath.Dir(opts.OutPath),
+			stateDir:   stateDir,
 		}, nil
 	}
 
+	return buildBatchOutputPlan(opts.OutPath, opts.SourceURLs), nil
+}
+
+func buildBatchOutputPlan(baseOutputDir string, sourceURLs []string) outputPlan {
+	base := strings.TrimSpace(baseOutputDir)
+	if base == "" {
+		base = defaultOutDir
+	}
+
+	now := nowFunc()
+	batchDate := now.Format("2006-01-02")
+	baseBatchID := buildBatchID(now, sourceURLs)
+	batchID := baseBatchID
+	batchDir := filepath.Join(base, batchDate, batchID)
+	sequence := 2
+	for pathExists(batchDir) {
+		batchID = fmt.Sprintf("%s-%d", baseBatchID, sequence)
+		batchDir = filepath.Join(base, batchDate, batchID)
+		sequence++
+	}
+
 	return outputPlan{
-		outputDir:  opts.OutPath,
-		summaryDir: opts.OutPath,
-	}, nil
+		outputRoot: base,
+		outputDir:  batchDir,
+		summaryDir: batchDir,
+		stateDir:   base,
+		batchID:    batchID,
+		batchDate:  batchDate,
+		namer:      &outputNamer{usedBases: map[string]struct{}{}},
+	}
+}
+
+func buildBatchID(now time.Time, sourceURLs []string) string {
+	timePart := now.Format("15-04-05")
+	label := batchLabelFromURLs(sourceURLs)
+	return timePart + "_" + label
+}
+
+func batchLabelFromURLs(sourceURLs []string) string {
+	if len(sourceURLs) == 0 {
+		return "run"
+	}
+
+	first := slugFromURLPath(sourceURLs[0])
+	if first == "" {
+		first = "run"
+	}
+	if len(sourceURLs) == 1 {
+		return first
+	}
+
+	extra := len(sourceURLs) - 1
+	label := fmt.Sprintf("%s-and-%d-more", first, extra)
+	return trimBaseLength(label, 64)
+}
+
+func slugFromURLPath(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil {
+		return "run"
+	}
+
+	pathPart := strings.TrimSpace(parsed.Path)
+	if pathPart == "" || pathPart == "/" {
+		return slugifyBatchLabel(parsed.Host)
+	}
+
+	segments := strings.Split(strings.Trim(pathPart, "/"), "/")
+	for i := len(segments) - 1; i >= 0; i-- {
+		part := strings.TrimSpace(segments[i])
+		if part == "" {
+			continue
+		}
+		part = strings.TrimSuffix(part, filepath.Ext(part))
+		if slug := slugifyBatchLabel(part); slug != "" {
+			return slug
+		}
+	}
+
+	return slugifyBatchLabel(parsed.Host)
+}
+
+func slugifyBatchLabel(value string) string {
+	normalized := strings.ToLower(strings.TrimSpace(value))
+	if normalized == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	lastDash := false
+
+	for _, r := range normalized {
+		allowed := (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9')
+		if allowed {
+			b.WriteRune(r)
+			lastDash = false
+			continue
+		}
+		if !lastDash && b.Len() > 0 {
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return ""
+	}
+	return trimBaseLength(out, 64)
+}
+
+func pathExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func prepareOutputPlan(plan outputPlan) error {
@@ -496,7 +675,464 @@ func prepareOutputPlan(plan outputPlan) error {
 		}
 	}
 
+	if plan.stateDir != "" && plan.stateDir != "." {
+		if err := os.MkdirAll(plan.stateDir, 0o755); err != nil {
+			return fmt.Errorf("create state directory: %w", err)
+		}
+	}
+
 	return nil
+}
+
+func resolveEnvPath(rawPath string) string {
+	trimmed := strings.TrimSpace(rawPath)
+	if trimmed == "" {
+		return defaultEnvFileName
+	}
+	return trimmed
+}
+
+func loadLocalEnv(path string) (map[string]string, error) {
+	envPath := resolveEnvPath(path)
+	if _, err := os.Stat(envPath); errors.Is(err, os.ErrNotExist) {
+		return map[string]string{}, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("check env file %s: %w", envPath, err)
+	}
+
+	if err := godotenv.Load(envPath); err != nil {
+		return nil, fmt.Errorf("load env file %s: %w", envPath, err)
+	}
+
+	values, err := godotenv.Read(envPath)
+	if err != nil {
+		return nil, fmt.Errorf("parse env file %s: %w", envPath, err)
+	}
+
+	return values, nil
+}
+
+func ensureEnvFile(path string) error {
+	envPath := resolveEnvPath(path)
+	if _, err := os.Stat(envPath); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("check env file %s: %w", envPath, err)
+	}
+
+	dir := filepath.Dir(envPath)
+	if dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create env directory %s: %w", dir, err)
+		}
+	}
+
+	defaultOut := strings.TrimSpace(defaultOutDir)
+	values := map[string]string{
+		"TRANSBLOG_MODEL":   "gpt-5.2",
+		"TRANSBLOG_WORKERS": strconv.Itoa(defaultTranslateWorkers),
+		"TRANSBLOG_OUT_DIR": defaultOut,
+	}
+	if err := godotenv.Write(values, envPath); err != nil {
+		return fmt.Errorf("write env file %s: %w", envPath, err)
+	}
+	return nil
+}
+
+func runOnboarding(opts options, envPath string, envValues map[string]string, apiKey string, stdout io.Writer, stderr io.Writer) (options, string, error) {
+	reader := bufio.NewReader(cliInput)
+	if err := ensureEnvFile(envPath); err != nil {
+		return opts, apiKey, err
+	}
+
+	mergedEnv := cloneEnvMap(envValues)
+	if mergedEnv == nil {
+		mergedEnv = map[string]string{}
+	}
+	changed := false
+
+	if strings.TrimSpace(mergedEnv["TRANSBLOG_MODEL"]) == "" {
+		mergedEnv["TRANSBLOG_MODEL"] = opts.Model
+		changed = true
+	}
+	if strings.TrimSpace(mergedEnv["TRANSBLOG_WORKERS"]) == "" {
+		mergedEnv["TRANSBLOG_WORKERS"] = strconv.Itoa(opts.Workers)
+		changed = true
+	}
+	if strings.TrimSpace(mergedEnv["TRANSBLOG_OUT_DIR"]) == "" {
+		outDir := strings.TrimSpace(opts.DefaultOut)
+		if outDir == "" {
+			outDir = defaultOutDir
+		}
+		mergedEnv["TRANSBLOG_OUT_DIR"] = outDir
+		changed = true
+	}
+	if strings.TrimSpace(mergedEnv["OPENAI_API_KEY"]) == "" && strings.TrimSpace(apiKey) != "" {
+		mergedEnv["OPENAI_API_KEY"] = strings.TrimSpace(apiKey)
+		changed = true
+	}
+	if strings.TrimSpace(mergedEnv["OPENAI_BASE_URL"]) == "" {
+		if baseURL := strings.TrimSpace(os.Getenv("OPENAI_BASE_URL")); baseURL != "" {
+			mergedEnv["OPENAI_BASE_URL"] = baseURL
+			changed = true
+		}
+	}
+
+	if strings.TrimSpace(apiKey) == "" {
+		_, _ = fmt.Fprintln(stderr, "OPENAI_API_KEY is not set.")
+		key, err := promptSecretInput(reader, stdout, "Paste OPENAI_API_KEY: ")
+		if err != nil {
+			return opts, "", err
+		}
+		apiKey = strings.TrimSpace(key)
+		mergedEnv["OPENAI_API_KEY"] = apiKey
+		changed = true
+		_ = os.Setenv("OPENAI_API_KEY", apiKey)
+	}
+
+	if !opts.flagSet("view") {
+		opts.GenerateBoth = true
+		_, _ = fmt.Fprintln(stdout, "Output mode: Markdown + HTML (default onboarding mode).")
+	}
+
+	reviewChanged, err := reviewOnboardingConfig(reader, stdout, mergedEnv)
+	if err != nil {
+		return opts, apiKey, err
+	}
+	if reviewChanged {
+		changed = true
+	}
+
+	applyEnvDefaults(&opts, mergedEnv)
+	resolvedAPIKey := strings.TrimSpace(mergedEnv["OPENAI_API_KEY"])
+	if resolvedAPIKey == "" {
+		resolvedAPIKey = strings.TrimSpace(apiKey)
+	}
+	apiKey = resolvedAPIKey
+	if resolvedAPIKey != "" {
+		_ = os.Setenv("OPENAI_API_KEY", resolvedAPIKey)
+	}
+	if baseURL, ok := mergedEnv["OPENAI_BASE_URL"]; ok {
+		_ = os.Setenv("OPENAI_BASE_URL", strings.TrimSpace(baseURL))
+	}
+
+	if changed {
+		if err := godotenv.Write(mergedEnv, envPath); err != nil {
+			return opts, apiKey, fmt.Errorf("write env file %s: %w", envPath, err)
+		}
+		_, _ = fmt.Fprintf(stdout, "Updated env file: %s\n", envPath)
+	}
+
+	if len(opts.SourceURLs) == 0 {
+		_, _ = fmt.Fprintln(stdout, "No URL provided.")
+		entered, err := promptRequiredInput(reader, stdout, "Paste URL(s) (space/comma/newline separated): ")
+		if err != nil {
+			return opts, apiKey, err
+		}
+		urls := parseEnteredURLs(entered)
+		if len(urls) == 0 {
+			return opts, apiKey, errors.New("at least one URL is required")
+		}
+		opts.SourceURLs = urls
+	}
+
+	return opts, apiKey, nil
+}
+
+func cloneEnvMap(src map[string]string) map[string]string {
+	if len(src) == 0 {
+		return nil
+	}
+
+	dst := make(map[string]string, len(src))
+	for key, value := range src {
+		dst[key] = value
+	}
+	return dst
+}
+
+func promptRequiredInput(reader *bufio.Reader, out io.Writer, prompt string) (string, error) {
+	for {
+		line, err := promptOptionalInput(reader, out, prompt)
+		if err != nil {
+			return "", err
+		}
+		if strings.TrimSpace(line) != "" {
+			return strings.TrimSpace(line), nil
+		}
+	}
+}
+
+func promptOptionalInput(reader *bufio.Reader, out io.Writer, prompt string) (string, error) {
+	_, _ = io.WriteString(out, prompt)
+	line, err := reader.ReadString('\n')
+	if err != nil {
+		if errors.Is(err, io.EOF) {
+			return strings.TrimSpace(line), nil
+		}
+		return "", fmt.Errorf("read input: %w", err)
+	}
+	return strings.TrimSpace(line), nil
+}
+
+func promptSecretInput(reader *bufio.Reader, out io.Writer, prompt string) (string, error) {
+	inputFile, ok := cliInput.(*os.File)
+	if !ok || inputFile != os.Stdin || !term.IsTerminal(int(inputFile.Fd())) {
+		return promptRequiredInput(reader, out, prompt)
+	}
+
+	for {
+		_, _ = io.WriteString(out, prompt)
+		state, err := term.MakeRaw(int(inputFile.Fd()))
+		if err != nil {
+			return promptRequiredInput(reader, out, prompt)
+		}
+
+		secret, readErr := readMaskedSecret(inputFile, out)
+		_ = term.Restore(int(inputFile.Fd()), state)
+		if readErr != nil {
+			return "", readErr
+		}
+
+		secret = strings.TrimSpace(secret)
+		if secret != "" {
+			return secret, nil
+		}
+	}
+}
+
+func readMaskedSecret(input *os.File, out io.Writer) (string, error) {
+	var buffer []byte
+	byteBuf := make([]byte, 1)
+
+	for {
+		_, err := input.Read(byteBuf)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				_, _ = io.WriteString(out, "\n")
+				return strings.TrimSpace(string(buffer)), nil
+			}
+			return "", fmt.Errorf("read input: %w", err)
+		}
+
+		b := byteBuf[0]
+		switch b {
+		case '\r', '\n':
+			_, _ = io.WriteString(out, "\n")
+			return strings.TrimSpace(string(buffer)), nil
+		case 127, 8:
+			if len(buffer) > 0 {
+				buffer = buffer[:len(buffer)-1]
+				_, _ = io.WriteString(out, "\b \b")
+			}
+		case 3:
+			return "", errors.New("input cancelled")
+		default:
+			if b >= 32 && b <= 126 {
+				buffer = append(buffer, b)
+				_, _ = io.WriteString(out, "*")
+			}
+		}
+	}
+}
+
+func parseEnteredURLs(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	replacer := strings.NewReplacer(",", " ", "\n", " ", "\t", " ")
+	normalized := replacer.Replace(raw)
+	return normalizeSourceURLs(strings.Fields(normalized))
+}
+
+func reviewOnboardingConfig(reader *bufio.Reader, out io.Writer, env map[string]string) (bool, error) {
+	if env == nil {
+		return false, nil
+	}
+
+	printConfigSnapshot(out, env)
+	answer, err := promptOptionalInput(reader, out, "Edit config before start? [y/N]: ")
+	if err != nil {
+		return false, err
+	}
+	if !isYes(answer) {
+		return false, nil
+	}
+
+	changed := false
+	for {
+		printConfigSnapshot(out, env)
+		choice, err := promptOptionalInput(reader, out, "Choose item to edit [1-5, Enter to continue]: ")
+		if err != nil {
+			return changed, err
+		}
+		if strings.TrimSpace(choice) == "" {
+			return changed, nil
+		}
+
+		switch strings.TrimSpace(choice) {
+		case "1":
+			secret, err := promptSecretInput(reader, out, "OPENAI_API_KEY: ")
+			if err != nil {
+				return changed, err
+			}
+			env["OPENAI_API_KEY"] = strings.TrimSpace(secret)
+			changed = true
+		case "2":
+			baseURL, err := promptOptionalInput(reader, out, "OPENAI_BASE_URL (empty to clear): ")
+			if err != nil {
+				return changed, err
+			}
+			env["OPENAI_BASE_URL"] = strings.TrimSpace(baseURL)
+			changed = true
+		case "3":
+			model, err := promptRequiredInput(reader, out, "TRANSBLOG_MODEL: ")
+			if err != nil {
+				return changed, err
+			}
+			env["TRANSBLOG_MODEL"] = strings.TrimSpace(model)
+			changed = true
+		case "4":
+			workersRaw, err := promptRequiredInput(reader, out, "TRANSBLOG_WORKERS: ")
+			if err != nil {
+				return changed, err
+			}
+			workers, convErr := strconv.Atoi(strings.TrimSpace(workersRaw))
+			if convErr != nil || workers <= 0 {
+				_, _ = fmt.Fprintln(out, "Workers must be a positive integer.")
+				continue
+			}
+			env["TRANSBLOG_WORKERS"] = strconv.Itoa(workers)
+			changed = true
+		case "5":
+			outDir, err := promptRequiredInput(reader, out, "TRANSBLOG_OUT_DIR: ")
+			if err != nil {
+				return changed, err
+			}
+			env["TRANSBLOG_OUT_DIR"] = strings.TrimSpace(outDir)
+			changed = true
+		default:
+			_, _ = fmt.Fprintln(out, "Invalid selection. Choose 1-5 or press Enter.")
+		}
+	}
+}
+
+func printConfigSnapshot(out io.Writer, env map[string]string) {
+	_, _ = fmt.Fprintln(out, "Current config:")
+	_, _ = fmt.Fprintf(out, "  1) OPENAI_API_KEY=%s\n", maskSecret(env["OPENAI_API_KEY"]))
+	_, _ = fmt.Fprintf(out, "  2) OPENAI_BASE_URL=%s\n", displayValue(env["OPENAI_BASE_URL"]))
+	_, _ = fmt.Fprintf(out, "  3) TRANSBLOG_MODEL=%s\n", displayValue(env["TRANSBLOG_MODEL"]))
+	_, _ = fmt.Fprintf(out, "  4) TRANSBLOG_WORKERS=%s\n", displayValue(env["TRANSBLOG_WORKERS"]))
+	_, _ = fmt.Fprintf(out, "  5) TRANSBLOG_OUT_DIR=%s\n", displayValue(env["TRANSBLOG_OUT_DIR"]))
+}
+
+func displayValue(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return "(empty)"
+	}
+	return trimmed
+}
+
+func maskSecret(secret string) string {
+	trimmed := strings.TrimSpace(secret)
+	if trimmed == "" {
+		return "(empty)"
+	}
+	if len(trimmed) <= 4 {
+		return strings.Repeat("*", len(trimmed))
+	}
+	return strings.Repeat("*", len(trimmed)-4) + trimmed[len(trimmed)-4:]
+}
+
+func isYes(value string) bool {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "y", "yes":
+		return true
+	default:
+		return false
+	}
+}
+
+func applyEnvDefaults(opts *options, envValues map[string]string) {
+	if opts == nil {
+		return
+	}
+
+	if !opts.flagSet("model") {
+		if model := strings.TrimSpace(envValues["TRANSBLOG_MODEL"]); model != "" {
+			opts.Model = model
+		}
+	}
+
+	if !opts.flagSet("workers") {
+		if workersRaw := strings.TrimSpace(envValues["TRANSBLOG_WORKERS"]); workersRaw != "" {
+			if workers, err := strconv.Atoi(workersRaw); err == nil && workers > 0 {
+				opts.Workers = workers
+			}
+		}
+	}
+
+	if !opts.flagSet("out") {
+		if outDir := strings.TrimSpace(envValues["TRANSBLOG_OUT_DIR"]); outDir != "" {
+			opts.DefaultOut = outDir
+		}
+	}
+}
+
+func buildMissingAPIKeyGuidance(envPath string, opts options) string {
+	outPath := strings.TrimSpace(opts.OutPath)
+	if outPath == "" {
+		outPath = strings.TrimSpace(opts.DefaultOut)
+	}
+	if outPath == "" {
+		outPath = defaultOutDir
+	}
+
+	return strings.Join([]string{
+		"OPENAI_API_KEY is required.",
+		"",
+		"First-time setup:",
+		"  1) export OPENAI_API_KEY=\"sk-...\"",
+		fmt.Sprintf("  2) (optional) edit %s to tune TRANSBLOG_MODEL/TRANSBLOG_WORKERS/TRANSBLOG_OUT_DIR", envPath),
+		"  3) run: transblog <url>",
+		"",
+		"Current defaults:",
+		fmt.Sprintf("  - model: %s", opts.Model),
+		fmt.Sprintf("  - workers: %d", opts.Workers),
+		fmt.Sprintf("  - out: %s", outPath),
+	}, "\n")
+}
+
+func buildSummaryLabels(opts options) []string {
+	mode := resolveWriteMode(opts)
+	labels := []string{
+		"model:" + strings.TrimSpace(opts.Model),
+		"mode:" + mode,
+		fmt.Sprintf("workers:%d", opts.Workers),
+	}
+	return labels
+}
+
+func uniqueStrings(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]struct{}, len(values))
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			continue
+		}
+		if _, exists := seen[trimmed]; exists {
+			continue
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	return out
 }
 
 func loadPriceConfig(path string) (priceConfig, error) {
@@ -821,30 +1457,49 @@ func processURL(
 	perURLOpts := opts
 	perURLOpts.SourceURLs = []string{taskSourceURL}
 
-	var output strings.Builder
-	if opts.View {
-		writeHTMLView(&output, pairs, perURLOpts)
-	} else {
-		writeMarkdown(&output, pairs, perURLOpts)
-	}
-
 	cost, costEstimated, costPartial := estimateCost(urlUsage, prices, opts.Model)
+	writeMode := resolveWriteMode(opts)
 
-	outPath, err := outputPathForURL(outPlan, taskSourceURL, opts.View)
+	var markdownPath string
+	var htmlPath string
+	outputPaths, err := outputPathsForURL(outPlan, sourceDoc.title, taskSourceURL)
 	if err != nil {
 		return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, err, urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
 	}
-	if err := os.WriteFile(outPath, []byte(output.String()), 0o644); err != nil {
-		return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, fmt.Errorf("write output file %s: %w", outPath, err), urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
+
+	if writeMode == "markdown" || writeMode == "both" {
+		var markdownOutput strings.Builder
+		writeMarkdown(&markdownOutput, pairs, perURLOpts)
+
+		markdownPath = outputPaths.markdown
+		if err := os.WriteFile(markdownPath, []byte(markdownOutput.String()), 0o644); err != nil {
+			return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, fmt.Errorf("write output file %s: %w", markdownPath, err), urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
+		}
+	}
+
+	if writeMode == "html" || writeMode == "both" {
+		var htmlOutput strings.Builder
+		writeHTMLView(&htmlOutput, pairs, perURLOpts)
+
+		htmlPath = outputPaths.html
+		if err := os.WriteFile(htmlPath, []byte(htmlOutput.String()), 0o644); err != nil {
+			return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, fmt.Errorf("write output file %s: %w", htmlPath, err), urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
+		}
 	}
 
 	if err := stateStore.markURLComplete(sourceURL); err != nil {
 		return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, fmt.Errorf("finalize resume state for %s: %w", sourceURL, err), urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
 	}
 
+	mainOutputPath := markdownPath
+	if mainOutputPath == "" {
+		mainOutputPath = htmlPath
+	}
+
 	return urlOutput{
 		finalURL:             taskSourceURL,
-		outputPath:           outPath,
+		outputPath:           mainOutputPath,
+		htmlOutputPath:       htmlPath,
 		qualityFallbackCount: urlQualityFallbackCount,
 		usage:                urlUsage,
 		costEstimate:         cost,
@@ -852,19 +1507,138 @@ func processURL(
 	}, nil
 }
 
-func outputPathForURL(plan outputPlan, sourceURL string, view bool) (string, error) {
+type outputPaths struct {
+	markdown string
+	html     string
+}
+
+func resolveWriteMode(opts options) string {
+	if opts.GenerateBoth {
+		return "both"
+	}
+	if opts.View {
+		return "html"
+	}
+	return "markdown"
+}
+
+func outputPathsForURL(plan outputPlan, title string, sourceURL string) (outputPaths, error) {
 	if plan.singleFile != "" {
-		return plan.singleFile, nil
+		return outputPaths{
+			markdown: plan.singleFile,
+			html:     htmlCompanionPath(plan.singleFile),
+		}, nil
 	}
 
-	filename, err := filenameFromURL(sourceURL, view)
+	baseName, err := reserveOutputBaseName(plan, title, sourceURL)
 	if err != nil {
+		return outputPaths{}, err
+	}
+
+	return outputPaths{
+		markdown: filepath.Join(plan.outputDir, baseName+".md"),
+		html:     filepath.Join(plan.outputDir, baseName+".html"),
+	}, nil
+}
+
+func reserveOutputBaseName(plan outputPlan, title string, sourceURL string) (string, error) {
+	preferred := filenameBaseFromTitle(title)
+	fallback, err := filenameBaseFromURL(sourceURL)
+	if err != nil && preferred == "" {
 		return "", err
 	}
-	return filepath.Join(plan.outputDir, filename), nil
+	if preferred == "" {
+		preferred = fallback
+	}
+	if strings.TrimSpace(preferred) == "" {
+		preferred = "output"
+	}
+
+	if plan.namer == nil {
+		plan.namer = &outputNamer{usedBases: map[string]struct{}{}}
+	}
+	return plan.namer.reserve(plan.outputDir, preferred), nil
+}
+
+func (n *outputNamer) reserve(outputDir string, desiredBase string) string {
+	base := strings.TrimSpace(desiredBase)
+	if base == "" {
+		base = "output"
+	}
+
+	if n.usedBases == nil {
+		n.usedBases = map[string]struct{}{}
+	}
+
+	base = trimBaseLength(base, 80)
+	if base == "" {
+		base = "output"
+	}
+
+	for suffix := 1; ; suffix++ {
+		candidate := base
+		if suffix > 1 {
+			candidate = withNumericSuffix(base, suffix)
+		}
+
+		key := strings.ToLower(candidate)
+		if _, exists := n.usedBases[key]; exists {
+			continue
+		}
+		if pathExists(filepath.Join(outputDir, candidate+".md")) || pathExists(filepath.Join(outputDir, candidate+".html")) {
+			continue
+		}
+
+		n.usedBases[key] = struct{}{}
+		return candidate
+	}
+}
+
+func withNumericSuffix(base string, suffix int) string {
+	suffixText := fmt.Sprintf("-%d", suffix)
+	maxBaseLen := 80 - len(suffixText)
+	if maxBaseLen < 1 {
+		maxBaseLen = 1
+	}
+	return trimBaseLength(base, maxBaseLen) + suffixText
+}
+
+func trimBaseLength(value string, maxRunes int) string {
+	if maxRunes <= 0 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return strings.Trim(value, "-_.")
+	}
+	return strings.Trim(string(runes[:maxRunes]), "-_.")
+}
+
+func htmlCompanionPath(path string) string {
+	ext := filepath.Ext(path)
+	if strings.EqualFold(ext, ".html") {
+		return path
+	}
+	if ext == "" {
+		return path + ".html"
+	}
+	return strings.TrimSuffix(path, ext) + ".html"
 }
 
 func filenameFromURL(rawURL string, view bool) (string, error) {
+	base, err := filenameBaseFromURL(rawURL)
+	if err != nil {
+		return "", err
+	}
+
+	ext := ".md"
+	if view {
+		ext = ".html"
+	}
+	return base + ext, nil
+}
+
+func filenameBaseFromURL(rawURL string) (string, error) {
 	parsed, err := url.Parse(rawURL)
 	if err != nil || parsed.Host == "" {
 		return "", fmt.Errorf("invalid URL: %s", rawURL)
@@ -881,11 +1655,40 @@ func filenameFromURL(rawURL string, view bool) (string, error) {
 		base = "output"
 	}
 
-	ext := ".md"
-	if view {
-		ext = ".html"
+	return base, nil
+}
+
+func filenameBaseFromTitle(title string) string {
+	trimmed := strings.TrimSpace(title)
+	if trimmed == "" {
+		return ""
 	}
-	return base + ext, nil
+
+	var b strings.Builder
+	lastSeparator := false
+
+	for _, r := range trimmed {
+		switch {
+		case unicode.IsLetter(r) || unicode.IsDigit(r):
+			b.WriteRune(r)
+			lastSeparator = false
+		case r == '-' || r == '_' || r == '.':
+			if b.Len() == 0 || lastSeparator {
+				continue
+			}
+			b.WriteRune(r)
+			lastSeparator = true
+		default:
+			if b.Len() == 0 || lastSeparator {
+				continue
+			}
+			b.WriteByte('-')
+			lastSeparator = true
+		}
+	}
+
+	candidate := strings.Trim(b.String(), "-_.")
+	return trimBaseLength(candidate, 80)
 }
 
 func sanitizeFilename(s string) string {

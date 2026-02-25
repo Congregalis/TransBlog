@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
 	"math"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/joho/godotenv"
 	versionpkg "transblog/internal/version"
 )
 
@@ -44,7 +46,7 @@ func TestRunMultiURLWritesPerURLOutputsAndSummary(t *testing.T) {
 	}))
 	t.Cleanup(openAIServer.Close)
 
-	tmpDir := useTempWorkingDir(t)
+	useTempWorkingDir(t)
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
 
@@ -56,7 +58,7 @@ func TestRunMultiURLWritesPerURLOutputsAndSummary(t *testing.T) {
 		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
 	}
 
-	summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
+	summaryPath := summaryPathFromStdout(t, stdout.String())
 	rawSummary, err := os.ReadFile(summaryPath)
 	if err != nil {
 		t.Fatalf("read summary file: %v", err)
@@ -69,6 +71,15 @@ func TestRunMultiURLWritesPerURLOutputsAndSummary(t *testing.T) {
 
 	if summary.TotalURLs != 2 || summary.SuccessCount != 2 || summary.FailureCount != 0 {
 		t.Fatalf("unexpected summary counters: %+v", summary)
+	}
+	if summary.BatchID == "" || summary.BatchDate == "" {
+		t.Fatalf("summary missing batch metadata: %+v", summary)
+	}
+	if len(summary.Labels) == 0 {
+		t.Fatalf("summary labels empty")
+	}
+	if len(summary.RetryableFailedURLs) != 0 {
+		t.Fatalf("retry_failed_urls=%v, want empty", summary.RetryableFailedURLs)
 	}
 	if len(summary.Results) != 2 {
 		t.Fatalf("summary results len = %d, want 2", len(summary.Results))
@@ -85,12 +96,12 @@ func TestRunMultiURLWritesPerURLOutputsAndSummary(t *testing.T) {
 		}
 	}
 
-	entries, err := os.ReadDir(filepath.Join(tmpDir, "out"))
+	entries, err := os.ReadDir(filepath.Dir(summaryPath))
 	if err != nil {
-		t.Fatalf("ReadDir(out): %v", err)
+		t.Fatalf("ReadDir(batch dir): %v", err)
 	}
 	if len(entries) != 3 {
-		t.Fatalf("out file count = %d, want 3", len(entries))
+		t.Fatalf("batch dir file count = %d, want 3", len(entries))
 	}
 
 	if !strings.Contains(stdout.String(), "Done: 2 succeeded, 0 failed") {
@@ -122,7 +133,7 @@ func TestRunMultiURLContinuesAfterSingleURLFailure(t *testing.T) {
 	}))
 	t.Cleanup(openAIServer.Close)
 
-	tmpDir := useTempWorkingDir(t)
+	useTempWorkingDir(t)
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
 
@@ -137,7 +148,7 @@ func TestRunMultiURLContinuesAfterSingleURLFailure(t *testing.T) {
 		t.Fatalf("Run() error = %q, want partial-failure message", err.Error())
 	}
 
-	summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
+	summaryPath := summaryPathFromStdout(t, stdout.String())
 	rawSummary, err := os.ReadFile(summaryPath)
 	if err != nil {
 		t.Fatalf("read summary file: %v", err)
@@ -150,6 +161,9 @@ func TestRunMultiURLContinuesAfterSingleURLFailure(t *testing.T) {
 
 	if summary.SuccessCount != 1 || summary.FailureCount != 1 {
 		t.Fatalf("unexpected summary counters: %+v", summary)
+	}
+	if len(summary.RetryableFailedURLs) != 1 || summary.RetryableFailedURLs[0] != contentServer.URL+"/bad" {
+		t.Fatalf("retry_failed_urls=%v, want [%s]", summary.RetryableFailedURLs, contentServer.URL+"/bad")
 	}
 
 	successFound := false
@@ -216,7 +230,7 @@ func TestRunSummaryIncludesTranslateErrorType(t *testing.T) {
 	}))
 	t.Cleanup(openAIServer.Close)
 
-	tmpDir := useTempWorkingDir(t)
+	useTempWorkingDir(t)
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
 
@@ -231,7 +245,7 @@ func TestRunSummaryIncludesTranslateErrorType(t *testing.T) {
 		t.Fatalf("Run() error = %q, want partial-failure message", err.Error())
 	}
 
-	summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
+	summaryPath := summaryPathFromStdout(t, stdout.String())
 	rawSummary, err := os.ReadFile(summaryPath)
 	if err != nil {
 		t.Fatalf("read summary file: %v", err)
@@ -266,86 +280,14 @@ func TestRunSummaryIncludesTranslateErrorType(t *testing.T) {
 }
 
 func TestRunSummaryIncludesOutputErrorType(t *testing.T) {
-	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/blocked":
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write([]byte(sampleArticle("Blocked", "blocked content")))
-		case "/ok":
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			_, _ = w.Write([]byte(sampleArticle("OK", "good content")))
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(contentServer.Close)
-
-	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/responses" {
-			http.NotFound(w, r)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = io.WriteString(w, `{"output_text":"译文内容"}`)
-	}))
-	t.Cleanup(openAIServer.Close)
-
-	tmpDir := useTempWorkingDir(t)
-	t.Setenv("OPENAI_API_KEY", "test-key")
-	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
-
-	blockedURL := contentServer.URL + "/blocked"
-	blockedFilename, err := filenameFromURL(blockedURL, false)
-	if err != nil {
-		t.Fatalf("filenameFromURL(%q): %v", blockedURL, err)
+	errType, errMessage, _, _, _, _, _ := errorDetails(
+		newProcessError(errorTypeOutput, errors.New("write output file /tmp/out.md: permission denied")),
+	)
+	if errType != errorTypeOutput {
+		t.Fatalf("error_type = %q, want %q", errType, errorTypeOutput)
 	}
-	blockedPath := filepath.Join(tmpDir, "out", blockedFilename)
-	if err := os.MkdirAll(blockedPath, 0o755); err != nil {
-		t.Fatalf("MkdirAll(%q): %v", blockedPath, err)
-	}
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-
-	err = Run([]string{blockedURL, contentServer.URL + "/ok"}, &stdout, &stderr)
-	if err == nil {
-		t.Fatalf("Run() error = nil, want partial-failure error")
-	}
-	if !strings.Contains(err.Error(), "1 URL(s) failed") {
-		t.Fatalf("Run() error = %q, want partial-failure message", err.Error())
-	}
-
-	summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
-	rawSummary, err := os.ReadFile(summaryPath)
-	if err != nil {
-		t.Fatalf("read summary file: %v", err)
-	}
-
-	var summary taskSummary
-	if err := json.Unmarshal(rawSummary, &summary); err != nil {
-		t.Fatalf("unmarshal summary JSON: %v", err)
-	}
-
-	if summary.SuccessCount != 1 || summary.FailureCount != 1 {
-		t.Fatalf("unexpected summary counters: %+v", summary)
-	}
-
-	var outputFailure *summaryItem
-	for i := range summary.Results {
-		item := &summary.Results[i]
-		if item.Success {
-			continue
-		}
-		outputFailure = item
-	}
-	if outputFailure == nil {
-		t.Fatalf("expected one output failure in summary, got %+v", summary.Results)
-	}
-	if outputFailure.ErrorType != errorTypeOutput {
-		t.Fatalf("error_type = %q, want %q", outputFailure.ErrorType, errorTypeOutput)
-	}
-	if !strings.Contains(outputFailure.ErrorMessage, "write output file") {
-		t.Fatalf("error_message=%q, want write output context", outputFailure.ErrorMessage)
+	if !strings.Contains(errMessage, "write output file") {
+		t.Fatalf("error_message=%q, want write output context", errMessage)
 	}
 }
 
@@ -373,7 +315,7 @@ func TestRunFailFastStopsAfterFirstFailure(t *testing.T) {
 	}))
 	t.Cleanup(openAIServer.Close)
 
-	tmpDir := useTempWorkingDir(t)
+	useTempWorkingDir(t)
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
 
@@ -387,7 +329,7 @@ func TestRunFailFastStopsAfterFirstFailure(t *testing.T) {
 		t.Fatalf("Run() error = nil, want fail-fast error")
 	}
 
-	summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
+	summaryPath := summaryPathFromStdout(t, stdout.String())
 	rawSummary, err := os.ReadFile(summaryPath)
 	if err != nil {
 		t.Fatalf("read summary file: %v", err)
@@ -579,6 +521,26 @@ func TestParseFlagsAllowsVersionWithoutURL(t *testing.T) {
 	}
 }
 
+func TestParseFlagsAllowsNoURLForOnboarding(t *testing.T) {
+	opts, err := parseFlags([]string{}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags() error = %v, want nil", err)
+	}
+	if len(opts.SourceURLs) != 0 {
+		t.Fatalf("SourceURLs len=%d, want 0", len(opts.SourceURLs))
+	}
+}
+
+func TestParseFlagsRejectsInitFlag(t *testing.T) {
+	_, err := parseFlags([]string{"--init"}, io.Discard)
+	if err == nil {
+		t.Fatalf("parseFlags() error = nil, want unknown flag error")
+	}
+	if !strings.Contains(err.Error(), "flag provided but not defined: -init") {
+		t.Fatalf("parseFlags() error = %v, want unknown init flag message", err)
+	}
+}
+
 func TestRunVersionSkipsAPIKeyRequirement(t *testing.T) {
 	oldVersion := versionpkg.Version
 	oldCommit := versionpkg.Commit
@@ -608,6 +570,331 @@ func TestRunVersionSkipsAPIKeyRequirement(t *testing.T) {
 	}
 	if stderr.Len() != 0 {
 		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
+
+func TestRunOnboardingCreatesEnvAndCollectsURL(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/post" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleArticle("Onboard", "onboard content")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"# title\n\ntranslated"}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	tmpDir := useTempWorkingDir(t)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	originalInput := cliInput
+	cliInput = strings.NewReader("\n" + contentServer.URL + "/post\n")
+	t.Cleanup(func() {
+		cliInput = originalInput
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := Run([]string{}, &stdout, &stderr); err != nil {
+		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
+	}
+
+	envPath := filepath.Join(tmpDir, defaultEnvFileName)
+	if _, err := os.Stat(envPath); err != nil {
+		t.Fatalf("expected env file at %s: %v", envPath, err)
+	}
+
+	outputPaths := outputPathsFromStdout(stdout.String())
+	if len(outputPaths) != 2 {
+		t.Fatalf("output paths len=%d, want 2; stdout=%s", len(outputPaths), stdout.String())
+	}
+	for _, outputPath := range outputPaths {
+		if _, err := os.Stat(outputPath); err != nil {
+			t.Fatalf("expected output at %s: %v", outputPath, err)
+		}
+	}
+	if !strings.Contains(stdout.String(), "Output mode: Markdown + HTML") {
+		t.Fatalf("stdout missing onboarding output mode message: %s", stdout.String())
+	}
+}
+
+func TestRunOnboardingPromptsForAPIKeyAndURL(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/post" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleArticle("Prompt", "prompt content")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	var authHeader atomic.Value
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		authHeader.Store(r.Header.Get("Authorization"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"# title\n\ntranslated"}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	useTempWorkingDir(t)
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	originalInput := cliInput
+	cliInput = strings.NewReader("sk-onboard\n\n" + contentServer.URL + "/post\n")
+	t.Cleanup(func() {
+		cliInput = originalInput
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := Run([]string{}, &stdout, &stderr); err != nil {
+		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
+	}
+
+	if got := authHeader.Load(); got != "Bearer sk-onboard" {
+		t.Fatalf("authorization header = %v, want Bearer sk-onboard", got)
+	}
+	if !strings.Contains(stderr.String(), "OPENAI_API_KEY is not set.") {
+		t.Fatalf("stderr missing onboarding key prompt: %s", stderr.String())
+	}
+
+	envPath := filepath.Join(".", defaultEnvFileName)
+	envValues, err := godotenv.Read(envPath)
+	if err != nil {
+		t.Fatalf("read env file: %v", err)
+	}
+	if got := envValues["OPENAI_API_KEY"]; got != "sk-onboard" {
+		t.Fatalf("OPENAI_API_KEY in .env = %q, want sk-onboard", got)
+	}
+}
+
+func TestRunOnboardingAllowsEditingConfig(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/post" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleArticle("Edit", "edit content")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	var requestedModel atomic.Value
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(body, &payload)
+		requestedModel.Store(payload.Model)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"# title\n\ntranslated"}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	useTempWorkingDir(t)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	originalInput := cliInput
+	cliInput = strings.NewReader(strings.Join([]string{
+		"y",
+		"3",
+		"gpt-edited",
+		"4",
+		"2",
+		"5",
+		"edited-out",
+		"",
+		contentServer.URL + "/post",
+	}, "\n"))
+	t.Cleanup(func() {
+		cliInput = originalInput
+	})
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if err := Run([]string{}, &stdout, &stderr); err != nil {
+		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
+	}
+
+	if got := requestedModel.Load(); got != "gpt-edited" {
+		t.Fatalf("requested model = %v, want gpt-edited", got)
+	}
+
+	outputPath := firstOutputPathFromStdout(t, stdout.String())
+	if !strings.Contains(outputPath, filepath.Join("edited-out")) {
+		t.Fatalf("output path = %s, want under edited-out", outputPath)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("expected markdown output in edited-out: %v", err)
+	}
+}
+
+func TestMaskSecret(t *testing.T) {
+	if got := maskSecret(""); got != "(empty)" {
+		t.Fatalf("maskSecret(empty) = %q, want (empty)", got)
+	}
+	if got := maskSecret("abcd"); got != "****" {
+		t.Fatalf("maskSecret(4 chars) = %q, want ****", got)
+	}
+	if got := maskSecret("sk-123456"); got != "*****3456" {
+		t.Fatalf("maskSecret(long) = %q, want *****3456", got)
+	}
+}
+
+func TestBuildBatchIDUsesReadableTimeAndSlug(t *testing.T) {
+	now := time.Date(2026, 2, 26, 0, 29, 9, 0, time.UTC)
+	id := buildBatchID(now, []string{"https://example.com/blog/writing-about-agentic-engineering-patterns"})
+	if id != "00-29-09_writing-about-agentic-engineering-patterns" {
+		t.Fatalf("batch id = %q, want readable time+slug", id)
+	}
+}
+
+func TestBuildBatchIDForMultipleURLsAddsCountHint(t *testing.T) {
+	now := time.Date(2026, 2, 26, 9, 8, 7, 0, time.UTC)
+	id := buildBatchID(now, []string{
+		"https://example.com/a/first-post",
+		"https://example.com/b/second-post",
+		"https://example.com/c/third-post",
+	})
+	if id != "09-08-07_first-post-and-2-more" {
+		t.Fatalf("batch id = %q, want first-post-and-2-more style", id)
+	}
+}
+
+func TestRunAppliesEnvDefaults(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/post" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleArticle("Config Post", "config content")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	var requestedModel atomic.Value
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(body, &payload)
+		requestedModel.Store(payload.Model)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"# title\n\ntranslated"}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	tmpDir := useTempWorkingDir(t)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	envPath := filepath.Join(tmpDir, defaultEnvFileName)
+	envContent := "TRANSBLOG_MODEL=gpt-config\nTRANSBLOG_WORKERS=1\nTRANSBLOG_OUT_DIR=custom-out\n"
+	if err := os.WriteFile(envPath, []byte(envContent), 0o644); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	sourceURL := contentServer.URL + "/post"
+	if err := Run([]string{sourceURL}, &stdout, &stderr); err != nil {
+		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
+	}
+
+	if got := requestedModel.Load(); got != "gpt-config" {
+		t.Fatalf("requested model = %v, want gpt-config", got)
+	}
+
+	outputPath := firstOutputPathFromStdout(t, stdout.String())
+	if !strings.Contains(outputPath, filepath.Join("custom-out")) {
+		t.Fatalf("output path = %s, want under custom-out", outputPath)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("expected output at %s: %v", outputPath, err)
+	}
+}
+
+func TestRunFlagOverridesEnvDefaults(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/post" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleArticle("Override Post", "override content")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	var requestedModel atomic.Value
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Model string `json:"model"`
+		}
+		_ = json.Unmarshal(body, &payload)
+		requestedModel.Store(payload.Model)
+
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"# title\n\ntranslated"}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	tmpDir := useTempWorkingDir(t)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	envPath := filepath.Join(tmpDir, defaultEnvFileName)
+	envContent := "TRANSBLOG_MODEL=gpt-config\nTRANSBLOG_WORKERS=1\nTRANSBLOG_OUT_DIR=custom-out\n"
+	if err := os.WriteFile(envPath, []byte(envContent), 0o644); err != nil {
+		t.Fatalf("write env file: %v", err)
+	}
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	sourceURL := contentServer.URL + "/post"
+	if err := Run([]string{"--model", "gpt-flag", sourceURL}, &stdout, &stderr); err != nil {
+		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
+	}
+
+	if got := requestedModel.Load(); got != "gpt-flag" {
+		t.Fatalf("requested model = %v, want gpt-flag", got)
 	}
 }
 
@@ -695,7 +982,7 @@ func TestRunSummaryTracksQualityFallbackCount(t *testing.T) {
 	}))
 	t.Cleanup(openAIServer.Close)
 
-	tmpDir := useTempWorkingDir(t)
+	useTempWorkingDir(t)
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
 
@@ -708,7 +995,7 @@ func TestRunSummaryTracksQualityFallbackCount(t *testing.T) {
 		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
 	}
 
-	summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
+	summaryPath := summaryPathFromStdout(t, stdout.String())
 	rawSummary, err := os.ReadFile(summaryPath)
 	if err != nil {
 		t.Fatalf("read summary file: %v", err)
@@ -768,7 +1055,7 @@ func TestRunSummaryTracksQualityFallbackCountOnFailure(t *testing.T) {
 	}))
 	t.Cleanup(openAIServer.Close)
 
-	tmpDir := useTempWorkingDir(t)
+	useTempWorkingDir(t)
 	t.Setenv("OPENAI_API_KEY", "test-key")
 	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
 
@@ -782,7 +1069,7 @@ func TestRunSummaryTracksQualityFallbackCountOnFailure(t *testing.T) {
 		t.Fatalf("Run() error = nil, want partial-failure error")
 	}
 
-	summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
+	summaryPath := summaryPathFromStdout(t, stdout.String())
 	rawSummary, err := os.ReadFile(summaryPath)
 	if err != nil {
 		t.Fatalf("read summary file: %v", err)
@@ -860,7 +1147,7 @@ func TestRunSummaryIncludesUsageAndCostEstimate(t *testing.T) {
 		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
 	}
 
-	summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
+	summaryPath := summaryPathFromStdout(t, stdout.String())
 	rawSummary, err := os.ReadFile(summaryPath)
 	if err != nil {
 		t.Fatalf("read summary file: %v", err)
@@ -945,7 +1232,7 @@ func TestRunHandlesMissingUsageGracefully(t *testing.T) {
 		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
 	}
 
-	summaryPath := filepath.Join(tmpDir, "out", "_summary.json")
+	summaryPath := summaryPathFromStdout(t, stdout.String())
 	rawSummary, err := os.ReadFile(summaryPath)
 	if err != nil {
 		t.Fatalf("read summary file: %v", err)
@@ -1066,11 +1353,7 @@ func TestRunResumeReusesSavedChunksAndMatchesSingleRun(t *testing.T) {
 			t.Fatalf("resume API calls=%d, want %d (chunk_count=%d saved=%d)", got, want, entry.ChunkCount, savedChunks)
 		}
 
-		filename, err := filenameFromURL(sourceURL, false)
-		if err != nil {
-			t.Fatalf("filenameFromURL: %v", err)
-		}
-		outputPath := filepath.Join(resumeDir, "out", filename)
+		outputPath := firstOutputPathFromStdout(t, stdout.String())
 		outputData, err := os.ReadFile(outputPath)
 		if err != nil {
 			t.Fatalf("read resumed output: %v", err)
@@ -1092,11 +1375,7 @@ func TestRunResumeReusesSavedChunksAndMatchesSingleRun(t *testing.T) {
 			t.Fatalf("baseline Run() error = %v; stderr=%s", err, stderr.String())
 		}
 
-		filename, err := filenameFromURL(sourceURL, false)
-		if err != nil {
-			t.Fatalf("filenameFromURL: %v", err)
-		}
-		outputPath := filepath.Join(baselineDir, "out", filename)
+		outputPath := firstOutputPathFromStdout(t, stdout.String())
 		outputData, err := os.ReadFile(outputPath)
 		if err != nil {
 			t.Fatalf("read baseline output: %v", err)
@@ -1173,4 +1452,50 @@ func sampleLongArticle(title string) string {
 	}
 	b.WriteString("</article></body></html>")
 	return b.String()
+}
+
+func summaryPathFromStdout(t *testing.T, stdout string) string {
+	t.Helper()
+
+	for _, line := range strings.Split(stdout, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "Summary: ") {
+			path := strings.TrimSpace(strings.TrimPrefix(trimmed, "Summary: "))
+			if path != "" {
+				return path
+			}
+		}
+	}
+	t.Fatalf("stdout missing summary path: %s", stdout)
+	return ""
+}
+
+func outputPathsFromStdout(stdout string) []string {
+	paths := make([]string, 0, 2)
+	for _, line := range strings.Split(stdout, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if idx := strings.Index(trimmed, "Output: "); idx >= 0 {
+			path := strings.TrimSpace(trimmed[idx+len("Output: "):])
+			if path != "" {
+				paths = append(paths, path)
+			}
+		}
+		if idx := strings.Index(trimmed, "Output (HTML): "); idx >= 0 {
+			path := strings.TrimSpace(trimmed[idx+len("Output (HTML): "):])
+			if path != "" {
+				paths = append(paths, path)
+			}
+		}
+	}
+	return paths
+}
+
+func firstOutputPathFromStdout(t *testing.T, stdout string) string {
+	t.Helper()
+
+	paths := outputPathsFromStdout(stdout)
+	if len(paths) == 0 {
+		t.Fatalf("stdout missing output path: %s", stdout)
+	}
+	return paths[0]
 }
