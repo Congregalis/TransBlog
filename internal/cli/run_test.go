@@ -531,6 +531,16 @@ func TestParseFlagsAllowsNoURLForOnboarding(t *testing.T) {
 	}
 }
 
+func TestParseFlagsAcceptsRefresh(t *testing.T) {
+	opts, err := parseFlags([]string{"--refresh", "https://example.com/post"}, io.Discard)
+	if err != nil {
+		t.Fatalf("parseFlags() error = %v, want nil", err)
+	}
+	if !opts.Refresh {
+		t.Fatalf("Refresh=false, want true")
+	}
+}
+
 func TestParseFlagsRejectsInitFlag(t *testing.T) {
 	_, err := parseFlags([]string{"--init"}, io.Discard)
 	if err == nil {
@@ -1260,6 +1270,240 @@ func TestRunHandlesMissingUsageGracefully(t *testing.T) {
 	}
 }
 
+func TestRunCacheSkipsFetchAndTranslateWithoutRefresh(t *testing.T) {
+	var fetchCalls int32
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetchCalls, 1)
+		if r.URL.Path != "/cache-me" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleArticle("Cache Me", "cache content body")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	var openAICalls int32
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&openAICalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"# 标题\n\n缓存译文","usage":{"input_tokens":100,"output_tokens":50,"total_tokens":150}}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	tmpDir := useTempWorkingDir(t)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	sourceURL := contentServer.URL + "/cache-me"
+
+	var stdout1 bytes.Buffer
+	var stderr1 bytes.Buffer
+	if err := Run([]string{"--chunk-size", "10000", sourceURL}, &stdout1, &stderr1); err != nil {
+		t.Fatalf("first Run() error = %v; stderr=%s", err, stderr1.String())
+	}
+
+	firstFetchCalls := atomic.LoadInt32(&fetchCalls)
+	firstOpenAICalls := atomic.LoadInt32(&openAICalls)
+	if firstFetchCalls == 0 || firstOpenAICalls == 0 {
+		t.Fatalf("expected first run to call fetch/openai, got fetch=%d openai=%d", firstFetchCalls, firstOpenAICalls)
+	}
+
+	var stdout2 bytes.Buffer
+	var stderr2 bytes.Buffer
+	if err := Run([]string{"--chunk-size", "10000", sourceURL}, &stdout2, &stderr2); err != nil {
+		t.Fatalf("second Run() error = %v; stderr=%s", err, stderr2.String())
+	}
+
+	if got := atomic.LoadInt32(&fetchCalls); got != firstFetchCalls {
+		t.Fatalf("fetch calls after cache run = %d, want %d", got, firstFetchCalls)
+	}
+	if got := atomic.LoadInt32(&openAICalls); got != firstOpenAICalls {
+		t.Fatalf("openai calls after cache run = %d, want %d", got, firstOpenAICalls)
+	}
+	if !strings.Contains(stderr2.String(), "Cache hit: reused") {
+		t.Fatalf("stderr missing cache hit message: %s", stderr2.String())
+	}
+
+	cachePath := filepath.Join(tmpDir, "out", cacheFileName)
+	if _, err := os.Stat(cachePath); err != nil {
+		t.Fatalf("expected cache file at %s: %v", cachePath, err)
+	}
+}
+
+func TestRunRefreshBypassesCache(t *testing.T) {
+	var fetchCalls int32
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetchCalls, 1)
+		if r.URL.Path != "/refresh-me" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleArticle("Refresh Me", "refresh content body")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	var openAICalls int32
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		atomic.AddInt32(&openAICalls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"# 标题\n\n刷新译文","usage":{"input_tokens":120,"output_tokens":60,"total_tokens":180}}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	useTempWorkingDir(t)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	sourceURL := contentServer.URL + "/refresh-me"
+
+	var stdout1 bytes.Buffer
+	var stderr1 bytes.Buffer
+	if err := Run([]string{"--chunk-size", "10000", sourceURL}, &stdout1, &stderr1); err != nil {
+		t.Fatalf("first Run() error = %v; stderr=%s", err, stderr1.String())
+	}
+
+	firstFetchCalls := atomic.LoadInt32(&fetchCalls)
+	firstOpenAICalls := atomic.LoadInt32(&openAICalls)
+
+	var stdout2 bytes.Buffer
+	var stderr2 bytes.Buffer
+	if err := Run([]string{"--refresh", "--chunk-size", "10000", sourceURL}, &stdout2, &stderr2); err != nil {
+		t.Fatalf("refresh Run() error = %v; stderr=%s", err, stderr2.String())
+	}
+
+	if got := atomic.LoadInt32(&fetchCalls); got <= firstFetchCalls {
+		t.Fatalf("fetch calls with --refresh = %d, want > %d", got, firstFetchCalls)
+	}
+	if got := atomic.LoadInt32(&openAICalls); got <= firstOpenAICalls {
+		t.Fatalf("openai calls with --refresh = %d, want > %d", got, firstOpenAICalls)
+	}
+}
+
+func TestRunMarkdownOutputIncludesEnhancedFrontMatter(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/meta" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleArticle("Meta Post", "front matter content")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"output_text":"# 标题\n\n前置信息","usage":{"input_tokens":321,"output_tokens":123,"total_tokens":444}}`)
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	useTempWorkingDir(t)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	sourceURL := contentServer.URL + "/meta"
+	if err := Run([]string{"--chunk-size", "10000", sourceURL}, &stdout, &stderr); err != nil {
+		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
+	}
+
+	outputPath := firstOutputPathFromStdout(t, stdout.String())
+	raw, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read output file: %v", err)
+	}
+	text := string(raw)
+
+	if !strings.Contains(text, "title: \"Meta Post\"") {
+		t.Fatalf("front matter missing title: %s", text)
+	}
+	if !strings.Contains(text, "lang: \"zh-CN\"") {
+		t.Fatalf("front matter missing lang: %s", text)
+	}
+	if !strings.Contains(text, "chunk_count: 1") {
+		t.Fatalf("front matter missing chunk_count: %s", text)
+	}
+	if !strings.Contains(text, "duration: \"") {
+		t.Fatalf("front matter missing duration: %s", text)
+	}
+	if !strings.Contains(text, "token_usage:") ||
+		!strings.Contains(text, "input: 321") ||
+		!strings.Contains(text, "output: 123") ||
+		!strings.Contains(text, "total: 444") {
+		t.Fatalf("front matter missing token_usage block: %s", text)
+	}
+}
+
+func TestRunHTMLViewIncludesReaderEnhancements(t *testing.T) {
+	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/html-tools" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write([]byte(sampleArticle("HTML Tools", "html enhancements content")))
+	}))
+	t.Cleanup(contentServer.Close)
+
+	openAIServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/responses" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, "{\"output_text\":\"# 标题\\n\\n```go\\nfmt.Println(1)\\n```\"}")
+	}))
+	t.Cleanup(openAIServer.Close)
+
+	useTempWorkingDir(t)
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", openAIServer.URL)
+
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	sourceURL := contentServer.URL + "/html-tools"
+	if err := Run([]string{"--view", "--chunk-size", "10000", sourceURL}, &stdout, &stderr); err != nil {
+		t.Fatalf("Run() error = %v; stderr=%s", err, stderr.String())
+	}
+
+	outputPath := firstOutputPathFromStdout(t, stdout.String())
+	htmlRaw, err := os.ReadFile(outputPath)
+	if err != nil {
+		t.Fatalf("read html output: %v", err)
+	}
+	htmlText := string(htmlRaw)
+
+	if strings.Contains(htmlText, `id="search-input"`) {
+		t.Fatalf("html should not include search input in lightweight mode: %s", htmlText)
+	}
+	if !strings.Contains(htmlText, `id="font-size-select"`) {
+		t.Fatalf("html missing font-size control: %s", htmlText)
+	}
+	if !strings.Contains(htmlText, "copy-code-btn") {
+		t.Fatalf("html missing copy-code handler: %s", htmlText)
+	}
+	if !strings.Contains(htmlText, "heading-anchor") {
+		t.Fatalf("html missing heading anchor support: %s", htmlText)
+	}
+	if !strings.Contains(htmlText, "syncFromLocationHash") {
+		t.Fatalf("html missing hash deep-link sync: %s", htmlText)
+	}
+}
+
 func TestRunResumeReusesSavedChunksAndMatchesSingleRun(t *testing.T) {
 	contentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/long" {
@@ -1383,7 +1627,7 @@ func TestRunResumeReusesSavedChunksAndMatchesSingleRun(t *testing.T) {
 		return string(outputData)
 	})
 
-	if resumedContent != baselineContent {
+	if stripFrontMatter(resumedContent) != stripFrontMatter(baselineContent) {
 		t.Fatalf("resumed output differs from one-shot output")
 	}
 	if atomic.LoadInt32(&phase3Calls) == 0 {
@@ -1425,6 +1669,19 @@ func runInWorkingDir(t *testing.T, dir string, fn func() string) string {
 	}()
 
 	return fn()
+}
+
+func stripFrontMatter(markdownText string) string {
+	if !strings.HasPrefix(markdownText, "---\n") {
+		return markdownText
+	}
+
+	endMarker := "\n---\n\n"
+	idx := strings.Index(markdownText, endMarker)
+	if idx < 0 {
+		return markdownText
+	}
+	return markdownText[idx+len(endMarker):]
 }
 
 func sampleArticle(title string, text string) string {

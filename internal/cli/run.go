@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"context"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,6 +15,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,6 +40,7 @@ const (
 	defaultOutDir           = "out"
 	summaryFileName         = "_summary.json"
 	stateFileName           = ".transblog.state.json"
+	cacheFileName           = ".transblog.cache.json"
 	defaultEnvFileName      = ".env"
 
 	errorTypeFetch     = "fetch_failed"
@@ -64,6 +68,7 @@ type options struct {
 	FailFast     bool
 	PriceConfig  string
 	Glossary     string
+	Refresh      bool
 	Timeout      time.Duration
 	ChunkSize    int
 	ShowHelp     bool
@@ -202,6 +207,36 @@ type resumeStore struct {
 	state resumeState
 }
 
+type translationCacheState struct {
+	Version   int                              `json:"version"`
+	UpdatedAt string                           `json:"updated_at"`
+	Entries   map[string]translationCacheEntry `json:"entries"`
+}
+
+type translationCacheEntry struct {
+	SourceURL            string       `json:"source_url"`
+	FinalURL             string       `json:"final_url,omitempty"`
+	SourceTitle          string       `json:"source_title,omitempty"`
+	ChunkCount           int          `json:"chunk_count"`
+	QualityFallbackCount int          `json:"quality_fallback_count,omitempty"`
+	Usage                usageStats   `json:"usage"`
+	Pairs                []cachedPair `json:"pairs"`
+	ConfigHash           string       `json:"config_hash"`
+	CachedAt             string       `json:"cached_at"`
+}
+
+type cachedPair struct {
+	SourceURL   string `json:"source_url"`
+	SourceTitle string `json:"source_title,omitempty"`
+	Source      string `json:"source"`
+	Translated  string `json:"translated"`
+}
+
+type cacheStore struct {
+	path  string
+	state translationCacheState
+}
+
 type processError struct {
 	errorType            string
 	qualityFallbackCount int
@@ -297,6 +332,15 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return err
 	}
 
+	cachePath := filepath.Join(outPlan.summaryDir, cacheFileName)
+	if strings.TrimSpace(outPlan.stateDir) != "" {
+		cachePath = filepath.Join(outPlan.stateDir, cacheFileName)
+	}
+	cache, err := loadCacheStore(cachePath)
+	if err != nil {
+		return err
+	}
+
 	openAIClient := openai.NewClient(apiKey, baseURL, httpClient, opts.MaxRetries)
 	runCtx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
@@ -317,7 +361,7 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		itemStart := time.Now()
 		item := summaryItem{SourceURL: sourceURL}
 
-		output, err := processURL(runCtx, httpClient, openAIClient, opts, glossaryMap, prices, sourceURL, outPlan, stateStore, stderr)
+		output, err := processURL(runCtx, httpClient, openAIClient, opts, glossaryMap, prices, sourceURL, outPlan, stateStore, cache, stderr)
 		item.DurationMS = time.Since(itemStart).Milliseconds()
 		if err != nil {
 			errorType, errorMessage, fallbackCount, failureUsage, failureCost, failureCostEstimated, failureCostPartial := errorDetails(err)
@@ -454,6 +498,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.IntVar(&opts.Workers, "workers", defaultTranslateWorkers, "Translation worker count")
 	fs.IntVar(&opts.MaxRetries, "max-retries", defaultMaxRetries, "Maximum retries for OpenAI requests")
 	fs.BoolVar(&opts.FailFast, "fail-fast", false, "Stop at first URL failure (default: continue for partial success)")
+	fs.BoolVar(&opts.Refresh, "refresh", false, "Ignore cache and force refetch/retranslate")
 	fs.StringVar(&opts.PriceConfig, "price-config", "", "Optional JSON pricing config file for cost estimation")
 	fs.StringVar(&opts.Glossary, "glossary", "", "Path to glossary JSON map, e.g. {\"term\":\"translation\"}")
 	fs.DurationVar(&opts.Timeout, "timeout", 90*time.Second, "HTTP timeout, e.g. 120s")
@@ -1110,6 +1155,7 @@ func buildSummaryLabels(opts options) []string {
 		"model:" + strings.TrimSpace(opts.Model),
 		"mode:" + mode,
 		fmt.Sprintf("workers:%d", opts.Workers),
+		fmt.Sprintf("refresh:%t", opts.Refresh),
 	}
 	return labels
 }
@@ -1315,6 +1361,161 @@ func (s *resumeStore) persist() error {
 	return nil
 }
 
+func loadCacheStore(path string) (*cacheStore, error) {
+	store := &cacheStore{
+		path: path,
+		state: translationCacheState{
+			Version: 1,
+			Entries: map[string]translationCacheEntry{},
+		},
+	}
+
+	content, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return store, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read cache file %s: %w", path, err)
+	}
+	if strings.TrimSpace(string(content)) == "" {
+		return store, nil
+	}
+
+	if err := json.Unmarshal(content, &store.state); err != nil {
+		return nil, fmt.Errorf("parse cache file %s: %w", path, err)
+	}
+	if store.state.Version == 0 {
+		store.state.Version = 1
+	}
+	if store.state.Entries == nil {
+		store.state.Entries = map[string]translationCacheEntry{}
+	}
+	return store, nil
+}
+
+func (s *cacheStore) get(cacheKey string) (translationCacheEntry, bool) {
+	if s == nil {
+		return translationCacheEntry{}, false
+	}
+	entry, ok := s.state.Entries[cacheKey]
+	if !ok {
+		return translationCacheEntry{}, false
+	}
+	if len(entry.Pairs) == 0 {
+		return translationCacheEntry{}, false
+	}
+	return entry, true
+}
+
+func (s *cacheStore) set(cacheKey string, entry translationCacheEntry) error {
+	if s == nil {
+		return nil
+	}
+	if strings.TrimSpace(cacheKey) == "" {
+		return nil
+	}
+	if s.state.Entries == nil {
+		s.state.Entries = map[string]translationCacheEntry{}
+	}
+
+	entry.CachedAt = time.Now().UTC().Format(time.RFC3339)
+	s.state.Entries[cacheKey] = entry
+	return s.persist()
+}
+
+func (s *cacheStore) persist() error {
+	if s == nil {
+		return nil
+	}
+
+	s.state.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
+	payload, err := json.MarshalIndent(s.state, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal cache state: %w", err)
+	}
+	payload = append(payload, '\n')
+
+	tmpPath := s.path + ".tmp"
+	if err := os.WriteFile(tmpPath, payload, 0o644); err != nil {
+		return fmt.Errorf("write cache temp file %s: %w", tmpPath, err)
+	}
+	if err := os.Rename(tmpPath, s.path); err != nil {
+		return fmt.Errorf("replace cache file %s: %w", s.path, err)
+	}
+	return nil
+}
+
+func buildCacheConfigHash(opts options, glossaryMap map[string]string) string {
+	keys := make([]string, 0, len(glossaryMap))
+	for key := range glossaryMap {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	glossaryPairs := make([][2]string, 0, len(keys))
+	for _, key := range keys {
+		glossaryPairs = append(glossaryPairs, [2]string{key, glossaryMap[key]})
+	}
+
+	payload := struct {
+		Model     string      `json:"model"`
+		ChunkSize int         `json:"chunk_size"`
+		Glossary  [][2]string `json:"glossary"`
+		Version   string      `json:"version"`
+	}{
+		Model:     strings.TrimSpace(opts.Model),
+		ChunkSize: opts.ChunkSize,
+		Glossary:  glossaryPairs,
+		Version:   version.String(),
+	}
+
+	return sha1Text(mustJSON(payload))
+}
+
+func buildURLCacheKey(sourceURL string, configHash string) string {
+	trimmed := strings.TrimSpace(sourceURL)
+	return sha1Text(trimmed + "|" + strings.TrimSpace(configHash))
+}
+
+func sha1Text(text string) string {
+	sum := sha1.Sum([]byte(text))
+	return hex.EncodeToString(sum[:])
+}
+
+func mustJSON(v any) string {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func cachedPairsToPairs(cached []cachedPair) []pair {
+	out := make([]pair, 0, len(cached))
+	for _, item := range cached {
+		out = append(out, pair{
+			sourceURL:   item.SourceURL,
+			sourceTitle: item.SourceTitle,
+			source:      item.Source,
+			translated:  item.Translated,
+		})
+	}
+	return out
+}
+
+func pairsToCachedPairs(items []pair) []cachedPair {
+	out := make([]cachedPair, 0, len(items))
+	for _, item := range items {
+		out = append(out, cachedPair{
+			SourceURL:   item.sourceURL,
+			SourceTitle: item.sourceTitle,
+			Source:      item.source,
+			Translated:  item.translated,
+		})
+	}
+	return out
+}
+
 func processURL(
 	ctx context.Context,
 	httpClient *http.Client,
@@ -1325,8 +1526,65 @@ func processURL(
 	sourceURL string,
 	outPlan outputPlan,
 	stateStore *resumeStore,
+	cache *cacheStore,
 	progress io.Writer,
 ) (urlOutput, error) {
+	urlStart := time.Now()
+	cacheConfigHash := buildCacheConfigHash(opts, glossaryMap)
+	cacheKey := buildURLCacheKey(sourceURL, cacheConfigHash)
+
+	if !opts.Refresh {
+		if cachedEntry, ok := cache.get(cacheKey); ok {
+			cachedPairs := cachedPairsToPairs(cachedEntry.Pairs)
+			if len(cachedPairs) > 0 {
+				_, _ = fmt.Fprintf(progress, "Cache hit: reused %d chunks for %s\n", len(cachedPairs), compactURL(sourceURL))
+
+				meta := outputMetadata{
+					Title:      cachedEntry.SourceTitle,
+					Lang:       "zh-CN",
+					ChunkCount: cachedEntry.ChunkCount,
+					Duration:   time.Since(urlStart),
+					Usage:      cachedEntry.Usage,
+				}
+				targetURL := strings.TrimSpace(cachedEntry.FinalURL)
+				if targetURL == "" {
+					targetURL = sourceURL
+				}
+				markdownPath, htmlPath, err := writeOutputsForPairs(cachedPairs, opts, outPlan, targetURL, meta)
+				if err != nil {
+					cost, costEstimated, costPartial := estimateCost(cachedEntry.Usage, prices, opts.Model)
+					return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, err, cachedEntry.QualityFallbackCount, cachedEntry.Usage, cost, costEstimated, costPartial)
+				}
+
+				if err := stateStore.markURLComplete(sourceURL); err != nil {
+					cost, costEstimated, costPartial := estimateCost(cachedEntry.Usage, prices, opts.Model)
+					return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, fmt.Errorf("finalize resume state for %s: %w", sourceURL, err), cachedEntry.QualityFallbackCount, cachedEntry.Usage, cost, costEstimated, costPartial)
+				}
+
+				cost, costEstimated, _ := estimateCost(cachedEntry.Usage, prices, opts.Model)
+				mainOutputPath := markdownPath
+				if mainOutputPath == "" {
+					mainOutputPath = htmlPath
+				}
+
+				finalURL := strings.TrimSpace(cachedEntry.FinalURL)
+				if finalURL == "" {
+					finalURL = sourceURL
+				}
+
+				return urlOutput{
+					finalURL:             finalURL,
+					outputPath:           mainOutputPath,
+					htmlOutputPath:       htmlPath,
+					qualityFallbackCount: cachedEntry.QualityFallbackCount,
+					usage:                cachedEntry.Usage,
+					costEstimate:         cost,
+					costEstimated:        costEstimated,
+				}, nil
+			}
+		}
+	}
+
 	doc, err := fetch.HTML(ctx, httpClient, sourceURL)
 	if err != nil {
 		return urlOutput{}, newProcessError(errorTypeFetch, fmt.Errorf("fetch %s: %w", sourceURL, err))
@@ -1458,33 +1716,29 @@ func processURL(
 	perURLOpts.SourceURLs = []string{taskSourceURL}
 
 	cost, costEstimated, costPartial := estimateCost(urlUsage, prices, opts.Model)
-	writeMode := resolveWriteMode(opts)
-
-	var markdownPath string
-	var htmlPath string
-	outputPaths, err := outputPathsForURL(outPlan, sourceDoc.title, taskSourceURL)
+	meta := outputMetadata{
+		Title:      sourceDoc.title,
+		Lang:       "zh-CN",
+		ChunkCount: len(pairs),
+		Duration:   time.Since(urlStart),
+		Usage:      urlUsage,
+	}
+	markdownPath, htmlPath, err := writeOutputsForPairs(pairs, perURLOpts, outPlan, taskSourceURL, meta)
 	if err != nil {
 		return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, err, urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
 	}
 
-	if writeMode == "markdown" || writeMode == "both" {
-		var markdownOutput strings.Builder
-		writeMarkdown(&markdownOutput, pairs, perURLOpts)
-
-		markdownPath = outputPaths.markdown
-		if err := os.WriteFile(markdownPath, []byte(markdownOutput.String()), 0o644); err != nil {
-			return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, fmt.Errorf("write output file %s: %w", markdownPath, err), urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
-		}
-	}
-
-	if writeMode == "html" || writeMode == "both" {
-		var htmlOutput strings.Builder
-		writeHTMLView(&htmlOutput, pairs, perURLOpts)
-
-		htmlPath = outputPaths.html
-		if err := os.WriteFile(htmlPath, []byte(htmlOutput.String()), 0o644); err != nil {
-			return urlOutput{}, newProcessErrorWithDetails(errorTypeOutput, fmt.Errorf("write output file %s: %w", htmlPath, err), urlQualityFallbackCount, urlUsage, cost, costEstimated, costPartial)
-		}
+	if err := cache.set(cacheKey, translationCacheEntry{
+		SourceURL:            sourceURL,
+		FinalURL:             taskSourceURL,
+		SourceTitle:          sourceDoc.title,
+		ChunkCount:           len(pairs),
+		QualityFallbackCount: urlQualityFallbackCount,
+		Usage:                urlUsage,
+		Pairs:                pairsToCachedPairs(pairs),
+		ConfigHash:           cacheConfigHash,
+	}); err != nil {
+		_, _ = fmt.Fprintf(progress, "Cache warning: failed to persist for %s (%v)\n", compactURL(taskSourceURL), err)
 	}
 
 	if err := stateStore.markURLComplete(sourceURL); err != nil {
@@ -1512,6 +1766,14 @@ type outputPaths struct {
 	html     string
 }
 
+type outputMetadata struct {
+	Title      string
+	Lang       string
+	ChunkCount int
+	Duration   time.Duration
+	Usage      usageStats
+}
+
 func resolveWriteMode(opts options) string {
 	if opts.GenerateBoth {
 		return "both"
@@ -1520,6 +1782,52 @@ func resolveWriteMode(opts options) string {
 		return "html"
 	}
 	return "markdown"
+}
+
+func writeOutputsForPairs(
+	pairs []pair,
+	opts options,
+	outPlan outputPlan,
+	sourceURL string,
+	meta outputMetadata,
+) (string, string, error) {
+	if meta.ChunkCount <= 0 {
+		meta.ChunkCount = len(pairs)
+	}
+	if strings.TrimSpace(meta.Lang) == "" {
+		meta.Lang = "zh-CN"
+	}
+
+	writeMode := resolveWriteMode(opts)
+	outputPaths, err := outputPathsForURL(outPlan, meta.Title, sourceURL)
+	if err != nil {
+		return "", "", err
+	}
+
+	var markdownPath string
+	var htmlPath string
+
+	if writeMode == "markdown" || writeMode == "both" {
+		var markdownOutput strings.Builder
+		writeMarkdown(&markdownOutput, pairs, opts, meta)
+
+		markdownPath = outputPaths.markdown
+		if err := os.WriteFile(markdownPath, []byte(markdownOutput.String()), 0o644); err != nil {
+			return "", "", fmt.Errorf("write output file %s: %w", markdownPath, err)
+		}
+	}
+
+	if writeMode == "html" || writeMode == "both" {
+		var htmlOutput strings.Builder
+		writeHTMLView(&htmlOutput, pairs, opts, meta)
+
+		htmlPath = outputPaths.html
+		if err := os.WriteFile(htmlPath, []byte(htmlOutput.String()), 0o644); err != nil {
+			return "", "", fmt.Errorf("write output file %s: %w", htmlPath, err)
+		}
+	}
+
+	return markdownPath, htmlPath, nil
 }
 
 func outputPathsForURL(plan outputPlan, title string, sourceURL string) (outputPaths, error) {
@@ -2214,24 +2522,56 @@ func compactURL(rawURL string) string {
 	return parsed.Host + path
 }
 
-func writeFrontMatter(w io.StringWriter, opts options) {
+func writeFrontMatter(w io.StringWriter, opts options, meta outputMetadata) {
 	now := time.Now().UTC().Format(time.RFC3339)
 	_, _ = w.WriteString("---\n")
+	_, _ = w.WriteString("title: ")
+	_, _ = w.WriteString(yamlQuote(meta.Title))
+	_, _ = w.WriteString("\n")
+	_, _ = w.WriteString("lang: ")
+	_, _ = w.WriteString(yamlQuote(meta.Lang))
+	_, _ = w.WriteString("\n")
+	_, _ = w.WriteString("chunk_count: ")
+	_, _ = w.WriteString(strconv.Itoa(meta.ChunkCount))
+	_, _ = w.WriteString("\n")
+	_, _ = w.WriteString("duration: ")
+	_, _ = w.WriteString(yamlQuote(meta.Duration.String()))
+	_, _ = w.WriteString("\n")
+	_, _ = w.WriteString("duration_ms: ")
+	_, _ = w.WriteString(strconv.FormatInt(meta.Duration.Milliseconds(), 10))
+	_, _ = w.WriteString("\n")
+	_, _ = w.WriteString("token_usage:\n")
+	_, _ = w.WriteString("  input: ")
+	_, _ = w.WriteString(strconv.FormatInt(meta.Usage.inputTokens, 10))
+	_, _ = w.WriteString("\n")
+	_, _ = w.WriteString("  output: ")
+	_, _ = w.WriteString(strconv.FormatInt(meta.Usage.outputTokens, 10))
+	_, _ = w.WriteString("\n")
+	_, _ = w.WriteString("  total: ")
+	_, _ = w.WriteString(strconv.FormatInt(meta.Usage.totalTokens, 10))
+	_, _ = w.WriteString("\n")
+	_, _ = w.WriteString("  missing_count: ")
+	_, _ = w.WriteString(strconv.Itoa(meta.Usage.missingUsageCount))
+	_, _ = w.WriteString("\n")
 	_, _ = w.WriteString("source_urls:\n")
 
 	for _, sourceURL := range opts.SourceURLs {
 		_, _ = w.WriteString("  - ")
-		_, _ = w.WriteString(sourceURL)
+		_, _ = w.WriteString(yamlQuote(sourceURL))
 		_, _ = w.WriteString("\n")
 	}
 
 	_, _ = w.WriteString("generated_at: ")
-	_, _ = w.WriteString(now)
+	_, _ = w.WriteString(yamlQuote(now))
 	_, _ = w.WriteString("\n")
 	_, _ = w.WriteString("model: ")
-	_, _ = w.WriteString(opts.Model)
+	_, _ = w.WriteString(yamlQuote(opts.Model))
 	_, _ = w.WriteString("\n")
 	_, _ = w.WriteString("---\n\n")
+}
+
+func yamlQuote(value string) string {
+	return strconv.Quote(strings.TrimSpace(value))
 }
 
 type pair struct {
@@ -2241,8 +2581,18 @@ type pair struct {
 	translated  string
 }
 
-func writeMarkdown(w io.StringWriter, pairs []pair, opts options) {
-	writeFrontMatter(w, opts)
+func writeMarkdown(w io.StringWriter, pairs []pair, opts options, meta outputMetadata) {
+	if strings.TrimSpace(meta.Title) == "" && len(pairs) > 0 {
+		meta.Title = pairs[0].sourceTitle
+	}
+	if strings.TrimSpace(meta.Lang) == "" {
+		meta.Lang = "zh-CN"
+	}
+	if meta.ChunkCount <= 0 {
+		meta.ChunkCount = len(pairs)
+	}
+
+	writeFrontMatter(w, opts, meta)
 
 	for i, p := range pairs {
 		if i > 0 {
@@ -2265,7 +2615,7 @@ func writeMarkdown(w io.StringWriter, pairs []pair, opts options) {
 	}
 }
 
-func writeHTMLView(w io.StringWriter, pairs []pair, opts options) {
+func writeHTMLView(w io.StringWriter, pairs []pair, opts options, meta outputMetadata) {
 	type viewPair struct {
 		SourceURL   string `json:"sourceURL"`
 		SourceTitle string `json:"sourceTitle,omitempty"`
@@ -2281,6 +2631,22 @@ func writeHTMLView(w io.StringWriter, pairs []pair, opts options) {
 			Source:      p.source,
 			Translated:  p.translated,
 		})
+	}
+	if strings.TrimSpace(meta.Title) == "" && len(pairs) > 0 {
+		meta.Title = pairs[0].sourceTitle
+	}
+	if strings.TrimSpace(meta.Title) == "" {
+		meta.Title = "TransBlog"
+	}
+	if strings.TrimSpace(meta.Lang) == "" {
+		meta.Lang = "zh-CN"
+	}
+	if meta.ChunkCount <= 0 {
+		meta.ChunkCount = len(pairs)
+	}
+	durationText := meta.Duration.String()
+	if strings.TrimSpace(durationText) == "" || durationText == "0s" {
+		durationText = "-"
 	}
 
 	payload, err := json.Marshal(viewPairs)
@@ -2300,7 +2666,10 @@ func writeHTMLView(w io.StringWriter, pairs []pair, opts options) {
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.11.1/styles/github-dark.min.css">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-:root { color-scheme: light; }
+:root {
+  color-scheme: light;
+  --reader-font-size: 16px;
+}
 body {
   font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Palatino, serif;
   line-height: 1.6;
@@ -2444,6 +2813,7 @@ button.toolbar-item {
   overflow-y: auto;
   padding: 18px;
   overscroll-behavior: contain;
+  font-size: var(--reader-font-size);
 }
 .chunk {
   margin-bottom: 28px;
@@ -2495,6 +2865,16 @@ button.toolbar-item {
   color: #475569;
 }
 .markdown-body a { color: #0f4ea8; text-underline-offset: 2px; }
+.markdown-body .heading-anchor {
+  margin-left: 8px;
+  font-size: 0.85em;
+  opacity: 0;
+  text-decoration: none;
+}
+.markdown-body h1:hover .heading-anchor,
+.markdown-body h2:hover .heading-anchor {
+  opacity: 1;
+}
 .markdown-body img { max-width: 100%; height: auto; }
 .markdown-body table {
   border-collapse: collapse;
@@ -2509,6 +2889,25 @@ button.toolbar-item {
   color: #64748b;
   font-family: "Avenir Next", "Segoe UI", sans-serif;
   font-size: 14px;
+}
+.code-block-wrap {
+  position: relative;
+}
+.copy-code-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.85);
+  color: #f8fafc;
+  font-size: 11px;
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  padding: 4px 8px;
+  cursor: pointer;
+}
+.copy-code-btn:hover {
+  background: rgba(30, 41, 59, 0.92);
 }
 body.theme-dark {
   color: #e2e8f0;
@@ -2572,6 +2971,11 @@ body.theme-dark .markdown-body blockquote {
 body.theme-dark .markdown-body a {
   color: #93c5fd;
 }
+body.theme-dark .copy-code-btn {
+  border-color: rgba(148, 163, 184, 0.45);
+  background: rgba(15, 23, 42, 0.82);
+  color: #e2e8f0;
+}
 body.theme-dark .markdown-body th,
 body.theme-dark .markdown-body td {
   border-color: #334155;
@@ -2623,13 +3027,21 @@ body.theme-dark .markdown-body td {
 `)
 
 	_, _ = w.WriteString("<header class=\"topbar\">\n")
-	_, _ = w.WriteString("<h1 id=\"page-title\">TransBlog</h1>\n")
+	_, _ = w.WriteString("<h1 id=\"page-title\">")
+	_, _ = w.WriteString(meta.Title)
+	_, _ = w.WriteString("</h1>\n")
 	_, _ = w.WriteString("<div class=\"meta\">Generated: ")
 	_, _ = w.WriteString(now)
 	_, _ = w.WriteString(" | Model: ")
 	_, _ = w.WriteString(opts.Model)
+	_, _ = w.WriteString(" | Lang: ")
+	_, _ = w.WriteString(meta.Lang)
 	_, _ = w.WriteString(" | Chunks: ")
-	_, _ = w.WriteString(fmt.Sprintf("%d", len(pairs)))
+	_, _ = w.WriteString(fmt.Sprintf("%d", meta.ChunkCount))
+	_, _ = w.WriteString(" | Duration: ")
+	_, _ = w.WriteString(durationText)
+	_, _ = w.WriteString(" | Tokens: ")
+	_, _ = w.WriteString(strconv.FormatInt(meta.Usage.totalTokens, 10))
 	_, _ = w.WriteString("</div>\n")
 	_, _ = w.WriteString("<div class=\"toolbar\">\n")
 	_, _ = w.WriteString("  <label class=\"toolbar-item\">")
@@ -2639,6 +3051,8 @@ body.theme-dark .markdown-body td {
 	_, _ = w.WriteString("  <button id=\"toc-toggle\" class=\"toolbar-item\" type=\"button\" aria-expanded=\"true\">收起目录</button>\n")
 	_, _ = w.WriteString("  <label class=\"toolbar-item\">Chunk")
 	_, _ = w.WriteString("<select id=\"chunk-jump\"></select></label>\n")
+	_, _ = w.WriteString("  <label class=\"toolbar-item\">字号")
+	_, _ = w.WriteString("<select id=\"font-size-select\"><option value=\"14\">小</option><option value=\"16\" selected>中</option><option value=\"18\">大</option><option value=\"20\">特大</option></select></label>\n")
 	_, _ = w.WriteString("  <div class=\"toolbar-item progress-chip\" id=\"reading-progress\">Chunk 0 / 0</div>\n")
 	_, _ = w.WriteString("</div>\n")
 	_, _ = w.WriteString("</header>\n")
@@ -2676,6 +3090,7 @@ body.theme-dark .markdown-body td {
   const tocToggle = document.getElementById("toc-toggle");
   const chunkJump = document.getElementById("chunk-jump");
   const progressEl = document.getElementById("reading-progress");
+  const fontSizeSelect = document.getElementById("font-size-select");
 
   const panes = {
     en: { el: paneEN },
@@ -2781,6 +3196,69 @@ body.theme-dark .markdown-body td {
     });
   }
 
+  function copyText(text) {
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      return navigator.clipboard.writeText(text);
+    }
+
+    return new Promise(function (resolve, reject) {
+      try {
+        const el = document.createElement("textarea");
+        el.value = text;
+        el.setAttribute("readonly", "readonly");
+        el.style.position = "fixed";
+        el.style.opacity = "0";
+        document.body.appendChild(el);
+        el.select();
+        const ok = document.execCommand("copy");
+        document.body.removeChild(el);
+        if (!ok) {
+          reject(new Error("copy failed"));
+          return;
+        }
+        resolve();
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  function decorateCodeBlocks(root) {
+    if (!root) {
+      return;
+    }
+    root.querySelectorAll("pre").forEach(function (pre) {
+      if (pre.parentElement && pre.parentElement.classList.contains("code-block-wrap")) {
+        return;
+      }
+      const wrapper = document.createElement("div");
+      wrapper.className = "code-block-wrap";
+      pre.parentNode.insertBefore(wrapper, pre);
+      wrapper.appendChild(pre);
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "copy-code-btn";
+      button.textContent = "Copy";
+      button.addEventListener("click", function () {
+        copyText(pre.innerText || "")
+          .then(function () {
+            button.textContent = "Copied";
+            window.setTimeout(function () {
+              button.textContent = "Copy";
+            }, 1200);
+          })
+          .catch(function () {
+            button.textContent = "Failed";
+            window.setTimeout(function () {
+              button.textContent = "Copy";
+            }, 1200);
+          });
+      });
+      wrapper.appendChild(button);
+    });
+  }
+
   function fixImageAttributes(root, baseURL) {
     if (!root) {
       return;
@@ -2818,6 +3296,23 @@ body.theme-dark .markdown-body td {
       const slug = slugifyHeading(heading.textContent);
       const suffix = slug || "section";
       heading.id = "en-heading-" + chunkIndex + "-" + headingIndex + "-" + suffix;
+    });
+  }
+
+  function decorateHeadingAnchors(root) {
+    if (!root) {
+      return;
+    }
+    root.querySelectorAll("h1, h2").forEach(function (heading) {
+      if (!heading.id || heading.querySelector(".heading-anchor")) {
+        return;
+      }
+      const anchor = document.createElement("a");
+      anchor.className = "heading-anchor";
+      anchor.href = "#" + heading.id;
+      anchor.textContent = "#";
+      anchor.setAttribute("aria-label", "锚点链接");
+      heading.appendChild(anchor);
     });
   }
 
@@ -2864,9 +3359,11 @@ body.theme-dark .markdown-body td {
       body.innerHTML = renderMarkdown(item[key]);
       if (paneId === "en") {
         annotateEnglishHeadings(body, index);
+        decorateHeadingAnchors(body);
       }
       fixImageAttributes(body, item.sourceURL);
       applyHighlighting(body);
+      decorateCodeBlocks(body);
 
       chunk.appendChild(meta);
       chunk.appendChild(body);
@@ -2914,6 +3411,34 @@ body.theme-dark .markdown-body td {
     });
   }
 
+  function setLocationHash(targetId) {
+    if (!targetId) {
+      return;
+    }
+    if (history && typeof history.replaceState === "function") {
+      history.replaceState(null, "", "#" + encodeURIComponent(targetId));
+      return;
+    }
+    window.location.hash = targetId;
+  }
+
+  function scrollToHeadingByID(targetId, behavior) {
+    if (!targetId) {
+      return;
+    }
+    const heading = document.getElementById(targetId);
+    if (!heading) {
+      return;
+    }
+    activePaneId = "en";
+    const targetTop = Math.max(elementTopInPane(heading, paneEN) - 8, 0);
+    markSuppressed("en", 140);
+    paneEN.scrollTo({ top: targetTop, behavior: behavior || "auto" });
+    window.setTimeout(function () {
+      scheduleSyncFrom("en");
+    }, 160);
+  }
+
   function buildTOC() {
     if (!tocNav) {
       return;
@@ -2939,13 +3464,8 @@ body.theme-dark .markdown-body td {
       button.textContent = label;
       button.setAttribute("data-target-id", heading.id);
       button.addEventListener("click", function () {
-        activePaneId = "en";
-        const targetTop = Math.max(elementTopInPane(heading, paneEN) - 8, 0);
-        markSuppressed("en", 140);
-        paneEN.scrollTo({ top: targetTop, behavior: "smooth" });
-        window.setTimeout(function () {
-          scheduleSyncFrom("en");
-        }, 160);
+        setLocationHash(heading.id);
+        scrollToHeadingByID(heading.id, "smooth");
       });
       tocNav.appendChild(button);
     });
@@ -2957,6 +3477,17 @@ body.theme-dark .markdown-body td {
   renderPane("zh", "translated");
   updateTitleFromContent();
   buildTOC();
+
+  paneEN.addEventListener("click", function (event) {
+    const anchor = event.target.closest(".heading-anchor");
+    if (!anchor) {
+      return;
+    }
+    event.preventDefault();
+    const targetId = anchor.getAttribute("href").replace(/^#/, "");
+    setLocationHash(targetId);
+    scrollToHeadingByID(targetId, "smooth");
+  });
 
   function updateChunkJumpOptions() {
     chunkJump.innerHTML = "";
@@ -2980,6 +3511,33 @@ body.theme-dark .markdown-body td {
   }
 
   updateChunkJumpOptions();
+
+  function applyFontSize(px) {
+    const value = Math.max(12, Math.min(24, Number(px) || 16));
+    document.documentElement.style.setProperty("--reader-font-size", String(value) + "px");
+    if (fontSizeSelect) {
+      fontSizeSelect.value = String(value);
+    }
+    try {
+      window.localStorage.setItem("transblog_font_size", String(value));
+    } catch (_) {}
+  }
+
+  if (fontSizeSelect) {
+    let initial = 16;
+    try {
+      const saved = Number(window.localStorage.getItem("transblog_font_size"));
+      if (saved >= 12 && saved <= 24) {
+        initial = saved;
+      }
+    } catch (_) {}
+    applyFontSize(initial);
+    fontSizeSelect.addEventListener("change", function () {
+      applyFontSize(fontSizeSelect.value);
+      refreshMetrics();
+      scheduleSyncFrom(activePaneId);
+    });
+  }
 
   function buildMetrics(paneId) {
     const pane = panes[paneId].el;
@@ -3213,8 +3771,27 @@ body.theme-dark .markdown-body td {
     });
   });
 
+  function syncFromLocationHash() {
+    const raw = window.location.hash.replace(/^#/, "");
+    if (!raw) {
+      return;
+    }
+    const decoded = decodeURIComponent(raw);
+    if (!decoded) {
+      return;
+    }
+    scrollToHeadingByID(decoded, "auto");
+  }
+
+  window.addEventListener("hashchange", function () {
+    syncFromLocationHash();
+  });
+
   updateProgress("en");
   applyTOCState(false);
+  window.setTimeout(function () {
+    syncFromLocationHash();
+  }, 0);
 })();
 </script>
 `)
