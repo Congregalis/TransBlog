@@ -195,6 +195,18 @@ func TestRunMultiURLContinuesAfterSingleURLFailure(t *testing.T) {
 	if !strings.Contains(stdout.String(), "Done: 1 succeeded, 1 failed") {
 		t.Fatalf("stdout missing final summary: %s", stdout.String())
 	}
+	if !strings.Contains(stderr.String(), "Retry URL: "+contentServer.URL+"/bad") {
+		t.Fatalf("stderr missing retry URL line: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "Retry URLs:") || !strings.Contains(stderr.String(), contentServer.URL+"/bad") {
+		t.Fatalf("stderr missing retry URL list: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "[URL Progress]") {
+		t.Fatalf("stderr missing URL progress output: %s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "chunks/s") || !strings.Contains(stderr.String(), "eta=") {
+		t.Fatalf("stderr missing chunk rate/eta output: %s", stderr.String())
+	}
 }
 
 func TestRunSummaryIncludesTranslateErrorType(t *testing.T) {

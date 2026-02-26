@@ -357,7 +357,10 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		Results:     make([]summaryItem, 0, len(opts.SourceURLs)),
 	}
 
-	for _, sourceURL := range opts.SourceURLs {
+	for index, sourceURL := range opts.SourceURLs {
+		urlSeq := index + 1
+		_, _ = fmt.Fprintf(stderr, "[URL %d/%d] Start: %s\n", urlSeq, len(opts.SourceURLs), compactURL(sourceURL))
+
 		itemStart := time.Now()
 		item := summaryItem{SourceURL: sourceURL}
 
@@ -394,6 +397,8 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 			summary.Results = append(summary.Results, item)
 			summary.RetryableFailedURLs = append(summary.RetryableFailedURLs, sourceURL)
 			_, _ = fmt.Fprintf(stderr, "Failed [%s]: %s (%s)\n", errorType, compactURL(sourceURL), errorMessage)
+			_, _ = fmt.Fprintf(stderr, "Retry URL: %s\n", sourceURL)
+			printURLProgress(stderr, runStart, urlSeq, len(opts.SourceURLs), summary.SuccessCount, summary.FailureCount)
 			if opts.FailFast {
 				_, _ = fmt.Fprintln(stderr, "Fail-fast enabled: stop after first failure.")
 				break
@@ -434,6 +439,7 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		if output.htmlOutputPath != "" {
 			_, _ = fmt.Fprintf(stdout, "Output (HTML): %s\n", output.htmlOutputPath)
 		}
+		printURLProgress(stderr, runStart, urlSeq, len(opts.SourceURLs), summary.SuccessCount, summary.FailureCount)
 	}
 
 	summary.TotalDurationMS = time.Since(runStart).Milliseconds()
@@ -476,6 +482,12 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		_, _ = fmt.Fprintf(stdout, "Estimated cost (%s): $%.6f\n", summary.CostEstimateModel, summary.CostEstimate)
 		if summary.CostEstimatePartial {
 			_, _ = fmt.Fprintln(stderr, "Cost estimate is partial due to missing usage data.")
+		}
+	}
+	if len(summary.RetryableFailedURLs) > 0 {
+		_, _ = fmt.Fprintln(stderr, "Retry URLs:")
+		for _, failedURL := range summary.RetryableFailedURLs {
+			_, _ = fmt.Fprintf(stderr, "  - %s\n", failedURL)
 		}
 	}
 
@@ -1179,6 +1191,68 @@ func uniqueStrings(values []string) []string {
 		out = append(out, trimmed)
 	}
 	return out
+}
+
+func printURLProgress(
+	out io.Writer,
+	runStart time.Time,
+	processed int,
+	total int,
+	successCount int,
+	failureCount int,
+) {
+	if out == nil || total <= 0 || processed <= 0 {
+		return
+	}
+
+	elapsed := time.Since(runStart)
+	rate := ratePerSecond(processed, elapsed)
+	eta := estimateRemainingDuration(processed, total, elapsed)
+	percent := processed * 100 / total
+
+	_, _ = fmt.Fprintf(
+		out,
+		"[URL Progress] %d/%d (%d%%) success=%d failed=%d | rate=%.2f url/s | eta=%s\n",
+		processed,
+		total,
+		percent,
+		successCount,
+		failureCount,
+		rate,
+		formatETA(eta),
+	)
+}
+
+func ratePerSecond(done int, elapsed time.Duration) float64 {
+	if done <= 0 {
+		return 0
+	}
+	if elapsed <= 0 {
+		return float64(done)
+	}
+	return float64(done) / elapsed.Seconds()
+}
+
+func estimateRemainingDuration(done int, total int, elapsed time.Duration) time.Duration {
+	remaining := total - done
+	if done <= 0 || remaining <= 0 || elapsed <= 0 {
+		return 0
+	}
+	rate := float64(done) / elapsed.Seconds()
+	if rate <= 0 {
+		return 0
+	}
+	return time.Duration(float64(remaining)/rate*float64(time.Second) + 0.5)
+}
+
+func formatETA(duration time.Duration) string {
+	if duration <= 0 {
+		return "0s"
+	}
+	if duration < time.Second {
+		return "<1s"
+	}
+	return duration.Round(time.Second).String()
 }
 
 func loadPriceConfig(path string) (priceConfig, error) {
@@ -2226,6 +2300,7 @@ func translateAllChunks(
 	qualityFallbackCount := 0
 	totalUsage := usageStats{}
 	var firstErr error
+	chunkStart := time.Now()
 
 	for result := range results {
 		totalUsage.add(result.usage)
@@ -2258,15 +2333,20 @@ func translateAllChunks(
 		qualityFallbackCount += result.qualityFallbackCount
 		completed++
 		percent := completed * 100 / len(tasks)
+		elapsed := time.Since(chunkStart)
+		rate := ratePerSecond(completed, elapsed)
+		eta := estimateRemainingDuration(completed, len(tasks), elapsed)
 		_, _ = fmt.Fprintf(
 			progress,
-			"[%d/%d] %d%% translated chunk %d/%d for %s\n",
+			"[%d/%d] %d%% translated chunk %d/%d for %s | rate=%.2f chunks/s | eta=%s\n",
 			completed,
 			len(tasks),
 			percent,
 			task.chunkNumber,
 			task.chunkTotal,
 			compactURL(task.sourceURL),
+			rate,
+			formatETA(eta),
 		)
 	}
 
