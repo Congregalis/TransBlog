@@ -520,6 +520,16 @@ func TestParseFlagsRejectsInvalidMaxRetries(t *testing.T) {
 	}
 }
 
+func TestParseFlagsRejectsNonPositiveChunkSize(t *testing.T) {
+	testCases := []string{"0", "-1"}
+	for _, value := range testCases {
+		_, err := parseFlags([]string{"--chunk-size", value, "https://example.com"}, io.Discard)
+		if err == nil || !strings.Contains(err.Error(), "--chunk-size must be positive") {
+			t.Fatalf("parseFlags error=%v, want chunk-size validation error for value=%s", err, value)
+		}
+	}
+}
+
 func TestParseFlagsAllowsVersionWithoutURL(t *testing.T) {
 	opts, err := parseFlags([]string{"--version"}, io.Discard)
 	if err != nil {

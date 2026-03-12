@@ -547,7 +547,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 		return options{}, errors.New("--max-retries must be 0 or greater")
 	}
 	if opts.ChunkSize <= 0 {
-		opts.ChunkSize = defaultChunkSize
+		return options{}, errors.New("--chunk-size must be positive")
 	}
 
 	opts.SourceURLs = fs.Args()
