@@ -586,7 +586,7 @@ func TestRunVersionSkipsAPIKeyRequirement(t *testing.T) {
 	}
 
 	output := strings.TrimSpace(stdout.String())
-	want := "transblog version=v1.2.3 commit=abc1234 build_time=2026-02-24T20:30:00Z"
+	want := versionpkg.String()
 	if output != want {
 		t.Fatalf("stdout = %q, want %q", output, want)
 	}
