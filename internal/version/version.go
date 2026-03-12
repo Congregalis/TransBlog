@@ -1,6 +1,9 @@
 package version
 
-import "fmt"
+import (
+	"fmt"
+	"runtime"
+)
 
 var (
 	Version   = "dev"
@@ -9,5 +12,13 @@ var (
 )
 
 func String() string {
-	return fmt.Sprintf("transblog version=%s commit=%s build_time=%s", Version, Commit, BuildTime)
+	return fmt.Sprintf(
+		"transblog version=%s commit=%s build_time=%s go=%s os=%s arch=%s",
+		Version,
+		Commit,
+		BuildTime,
+		runtime.Version(),
+		runtime.GOOS,
+		runtime.GOARCH,
+	)
 }
