@@ -36,6 +36,14 @@ type Usage struct {
 	Available    bool
 }
 
+// Translator 接口定义了翻译客户端必须实现的方法
+type Translator interface {
+	TranslateMarkdownChunk(ctx context.Context, model string, mdChunk string, glossaryMap map[string]string) (string, error)
+	TranslateMarkdownChunkWithUsage(ctx context.Context, model string, mdChunk string, glossaryMap map[string]string) (string, Usage, error)
+	TranslateMarkdownChunkStrict(ctx context.Context, model string, mdChunk string, glossaryMap map[string]string, failureReason string) (string, error)
+	TranslateMarkdownChunkStrictWithUsage(ctx context.Context, model string, mdChunk string, glossaryMap map[string]string, failureReason string) (string, Usage, error)
+}
+
 func NewClient(apiKey string, baseURL string, httpClient *http.Client, maxRetries int) *Client {
 	if strings.TrimSpace(baseURL) == "" {
 		baseURL = defaultBaseURL

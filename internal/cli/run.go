@@ -71,6 +71,7 @@ type options struct {
 	Refresh      bool
 	Timeout      time.Duration
 	ChunkSize    int
+	APIMode      string
 	ShowHelp     bool
 	SourceURLs   []string
 	setFlags     map[string]bool
@@ -287,8 +288,40 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 	}
 	applyEnvDefaults(&opts, envValues)
 
-	apiKey := strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
 	opts.SourceURLs = normalizeSourceURLs(opts.SourceURLs)
+
+	// Determine API mode first (CLI flag > env var > default)
+	apiMode := opts.APIMode
+	if apiMode == "" {
+		apiMode = strings.TrimSpace(os.Getenv("OPENAI_API_MODE"))
+	}
+	if apiMode == "" {
+		apiMode = "responses"
+	}
+
+	// Read API key and base URL based on mode
+	var apiKey, baseURL string
+	switch apiMode {
+	case "chat":
+		apiKey = strings.TrimSpace(os.Getenv("OPENAI_CHAT_API_KEY"))
+		baseURL = strings.TrimSpace(os.Getenv("OPENAI_CHAT_BASE_URL"))
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		}
+		if baseURL == "" {
+			baseURL = strings.TrimSpace(os.Getenv("OPENAI_BASE_URL"))
+		}
+	default:
+		apiKey = strings.TrimSpace(os.Getenv("OPENAI_RESPONSES_API_KEY"))
+		baseURL = strings.TrimSpace(os.Getenv("OPENAI_RESPONSES_BASE_URL"))
+		if apiKey == "" {
+			apiKey = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		}
+		if baseURL == "" {
+			baseURL = strings.TrimSpace(os.Getenv("OPENAI_BASE_URL"))
+		}
+	}
+
 	if apiKey == "" || len(opts.SourceURLs) == 0 {
 		opts, apiKey, err = runOnboarding(opts, envPath, envValues, apiKey, stdout, stderr)
 		if err != nil {
@@ -302,7 +335,6 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return errors.New("at least one URL is required")
 	}
 
-	baseURL := strings.TrimSpace(os.Getenv("OPENAI_BASE_URL"))
 	httpClient := &http.Client{Timeout: opts.Timeout}
 
 	glossaryMap, err := glossary.Load(opts.Glossary)
@@ -341,7 +373,13 @@ func Run(args []string, stdout io.Writer, stderr io.Writer) error {
 		return err
 	}
 
-	openAIClient := openai.NewClient(apiKey, baseURL, httpClient, opts.MaxRetries)
+	var openAIClient openai.Translator
+	switch apiMode {
+	case "chat":
+		openAIClient = openai.NewChatClient(apiKey, baseURL, httpClient, opts.MaxRetries)
+	default:
+		openAIClient = openai.NewClient(apiKey, baseURL, httpClient, opts.MaxRetries)
+	}
 	runCtx, stopSignal := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignal()
 	runStart := time.Now()
@@ -515,6 +553,7 @@ func parseFlags(args []string, stderr io.Writer) (options, error) {
 	fs.StringVar(&opts.Glossary, "glossary", "", "Path to glossary JSON map, e.g. {\"term\":\"translation\"}")
 	fs.DurationVar(&opts.Timeout, "timeout", 90*time.Second, "HTTP timeout, e.g. 120s")
 	fs.IntVar(&opts.ChunkSize, "chunk-size", defaultChunkSize, "Target chunk size in characters")
+	fs.StringVar(&opts.APIMode, "api-mode", "", "API mode: responses or chat (default: responses)")
 
 	fs.Usage = func() {
 		fmt.Fprintln(stderr, "Usage: transblog [flags] <url> [url...]")
@@ -1593,7 +1632,7 @@ func pairsToCachedPairs(items []pair) []cachedPair {
 func processURL(
 	ctx context.Context,
 	httpClient *http.Client,
-	openAIClient *openai.Client,
+	openAIClient openai.Translator,
 	opts options,
 	glossaryMap map[string]string,
 	prices priceConfig,
@@ -2193,7 +2232,7 @@ type translationResult struct {
 
 func translateAllChunks(
 	ctx context.Context,
-	client *openai.Client,
+	client openai.Translator,
 	model string,
 	glossaryMap map[string]string,
 	tasks []translationTask,
@@ -2360,7 +2399,7 @@ func translateAllChunks(
 
 func translateChunkWithQualityGuard(
 	ctx context.Context,
-	client *openai.Client,
+	client openai.Translator,
 	model string,
 	sourceChunk string,
 	glossaryMap map[string]string,
